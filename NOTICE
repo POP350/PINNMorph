@@ -1,0 +1,24 @@
+PINNMorph
+
+The first-party PINNMorph source, scripts, configurations and documentation
+are licensed under the Apache License, Version 2.0. See LICENSE.
+
+Bundled third-party components retain their respective upstream licenses.
+The root Apache-2.0 license does not replace those licenses.
+
+PINNacle runtime and reference-data subset
+  Location: third_party/pinnacle/
+  Upstream: https://github.com/i207M/PINNacle
+  Copyright (c) 2024 PINNacle Dev Team
+  License: MIT; see third_party/pinnacle/LICENSE.
+  This is a vendored runtime subset, not the complete upstream distribution.
+
+DeepXDE 1.8.1 runtime subset bundled by PINNacle
+  Location: third_party/pinnacle/deepxde/
+  Upstream: https://github.com/lululxvi/deepxde
+  Version: recorded in third_party/pinnacle/deepxde/__about__.py.
+  License: GNU Lesser General Public License, Version 2.1;
+           see third_party/pinnacle/deepxde/LICENSE.
+  Original license source:
+    https://raw.githubusercontent.com/lululxvi/deepxde/v1.8.1/LICENSE
+  The bundled library source is included in this directory.

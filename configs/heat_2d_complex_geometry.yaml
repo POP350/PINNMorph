@@ -1,0 +1,16 @@
+extends: base.yaml
+pde: heat_2d_complex_geometry
+method: single_trajectory_eoh_policy_population
+algorithm_overrides:
+  optimization:
+    # Parabolic heat equation on complex geometry: balanced first-order
+    # geometry adaptation and second-order residual polishing.
+    phases:
+      - optimizer: adam
+        iterations: 14000
+        parameters: {learning_rate: 0.001}
+        scheduler: {name: none, parameters: {}}
+      - optimizer: lbfgs
+        iterations: 6000
+        parameters: {learning_rate: 1.0, history_size: 100, line_search_fn: strong_wolfe}
+        scheduler: {name: none, parameters: {}}

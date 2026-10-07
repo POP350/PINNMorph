@@ -1,0 +1,74 @@
+extends: training_base.yaml
+capability_ablation: none
+phase: pinn_online_llm_evolution
+result_group: pinn_online_llm_evolution
+research_question: Single-trajectory EOH evolution of executable PINN adaptation policies
+seeds:
+- 0
+- 1
+- 2
+- 3
+- 4
+outer_evolution: false
+budget:
+  total_optimizer_steps: 20000
+  maximum_sampling_points: 12000
+online_morphing:
+  policy_set:
+    prior_evidence_path: null
+    prior_evidence_auto_refresh: false
+    prior_evidence_maximum_runs: 64
+    static_prior:
+      enabled: true
+      path: null
+      maximum_items: 8
+  adaptive_strategy:
+    bottleneck_enabled: false
+    progressive_enabled: false
+    temporal:
+      enabled: false
+    trial_control:
+      enabled: false
+    influence_guard:
+      enabled: false
+    llm_efficiency:
+      enabled: false
+  allowed_primitives:
+  - WIDEN
+  - ADD_LAYER
+  - PRUNE
+  - REGROW
+  - REDISTRIBUTE
+  - LOCAL_REINIT
+  - ADD_RESIDUAL_BRANCH
+  - ADD_CORRECTION_BRANCH
+  - ADD_FOURIER_BRANCH
+  - ADD_GATED_BRANCH
+  - ADD_LOCALIZED_EXPERT
+  - ADD_ADAPTIVE_FOURIER_BRANCH
+  - ADD_COMPONENT_EXPERT
+  - REALLOCATE_COMPONENT_CAPACITY
+  - SPLIT_CONFLICTING_TOPOLOGY
+  - REBALANCE_LOSS_WEIGHTS
+  - BALANCE_COMPONENT_GRADIENTS
+  - REWEIGHT_RESIDUAL_REGIONS
+  - PROJECT_CONFLICTING_GRADIENTS
+  - EMPHASIZE_CONSTRAINTS
+  - MITIGATE_GRADIENT_CONFLICT
+  - ADAPT_SAMPLING_DISTRIBUTION
+  - ENTER_LBFGS_PHASE
+  minimum_iterations_before_morph: 400
+  activation_only_iterations: 10
+  new_parameters_only_iterations: 50
+  joint_learning_rate_scale: 1.0
+  optimizer_state_after_morph:
+    mode: preserve
+  utility:
+    minimum_relative_improvement: 0.01
+    max_component_degradation: 0.1
+llm:
+  candidate_generation: {}
+  candidate_scoring: {}
+  timeout_seconds: 120
+no_morph_optimizer_schedule: matched
+paper_protocol: provided_iclr2027_submission

@@ -1,0 +1,20 @@
+extends: base.yaml
+pde: poisson_2d_many_area
+method: single_trajectory_eoh_policy_population
+algorithm_overrides:
+  optimization:
+    # Multi-area/interface elliptic problem: keep balanced Adam/L-BFGS because
+    # interface/Robin regions need exploration before second-order polishing.
+    phases:
+      - optimizer: adam
+        iterations: 14000
+        parameters: {learning_rate: 0.001}
+        scheduler: {name: none, parameters: {}}
+      - optimizer: lbfgs
+        iterations: 6000
+        parameters: {learning_rate: 1.0, history_size: 100, line_search_fn: strong_wolfe}
+        scheduler: {name: none, parameters: {}}
+  loss:
+    terms:
+      - {name: pde_residual, loss_function: mse, weight: 1.0, parameters: {}}
+      - {name: robinbc_1, loss_function: mse, weight: 10.0, parameters: {}}

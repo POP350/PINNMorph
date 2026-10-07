@@ -1,0 +1,33 @@
+extends: base.yaml
+pde: burgers_1d
+method: single_trajectory_eoh_policy_population
+algorithm_overrides:
+  constraint_enforcement:
+    method: problem_hard
+    transform_id: burgers_1d_initial_dirichlet_exact
+    parameters: {}
+  sampling:
+    # Burgers-1D accuracy is now dominated by the interior shock/PDE residual:
+    # the hard ansatz makes BC/IC essentially exact, so spend the budget on a
+    # denser fixed interior mesh and leave only light constraint probes.
+    interior: {strategy: uniform, parameters: {n_points: 11744}}
+    boundary: {strategy: uniform, parameters: {n_points: 128}}
+    initial: {strategy: uniform, parameters: {n_points: 128}}
+  optimization:
+    # Adam is a maximum residence, not a fixed schedule: online diagnostics/LLM
+    # may enter L-BFGS earlier on a physics plateau; otherwise the trainer
+    # forces entry no later than step 14000.
+    phases:
+      - optimizer: adam
+        iterations: 14000
+        parameters: {learning_rate: 0.001}
+        scheduler: {name: none, parameters: {}}
+      - optimizer: lbfgs
+        iterations: 6000
+        parameters: {learning_rate: 1.0, history_size: 100, line_search_fn: strong_wolfe}
+        scheduler: {name: none, parameters: {}}
+online_morphing:
+  policy_set:
+    scoring:
+      temperature: 0.0
+      keep_margin: 0.10

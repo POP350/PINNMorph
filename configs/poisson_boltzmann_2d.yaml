@@ -1,0 +1,20 @@
+extends: base.yaml
+pde: poisson_boltzmann_2d
+method: single_trajectory_eoh_policy_population
+algorithm_overrides:
+  optimization:
+    # Nonlinear elliptic Boltzmann term needs a moderate Adam basin-finding
+    # phase before extended L-BFGS refinement.
+    phases:
+      - optimizer: adam
+        iterations: 14000
+        parameters: {learning_rate: 0.001}
+        scheduler: {name: none, parameters: {}}
+      - optimizer: lbfgs
+        iterations: 6000
+        parameters: {learning_rate: 1.0, history_size: 100, line_search_fn: strong_wolfe}
+        scheduler: {name: none, parameters: {}}
+  loss:
+    terms:
+      - {name: pde_residual, loss_function: mse, weight: 1.0, parameters: {}}
+      - {name: boundary_condition, loss_function: mse, weight: 10.0, parameters: {}}

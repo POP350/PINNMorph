@@ -1,0 +1,42 @@
+extends: base.yaml
+pde: burgers_2d
+method: single_trajectory_eoh_policy_population
+algorithm_overrides:
+  network:
+    input_transform:
+      name: periodic_positional_encoding
+      parameters:
+        frequency_count: 16
+        frequency_scale: 0.5
+        trainable_frequencies: false
+        include_raw_input: false
+  sampling:
+    initial:
+      strategy: uniform
+      parameters:
+        n_points: 2048
+  optimization:
+    phases:
+    - optimizer: adam
+      iterations: 14000
+      parameters:
+        learning_rate: 0.001
+      scheduler:
+        name: none
+        parameters: {}
+    - optimizer: lbfgs
+      iterations: 6000
+      parameters:
+        learning_rate: 1.0
+        history_size: 100
+        line_search_fn: strong_wolfe
+      scheduler:
+        name: none
+        parameters: {}
+online_morphing:
+  utility:
+    weights:
+      pde: 1.0
+      boundary: 1.0
+      initial: 1.0
+      observation: 1.0

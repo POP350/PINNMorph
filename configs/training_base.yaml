@@ -1,0 +1,188 @@
+schema_version: 1
+history_interval: 10
+outer_evolution: false
+budget:
+  total_optimizer_steps: 20000
+  maximum_sampling_points: null
+  constraint_resample_interval: 50
+  component_gradient_diagnostics_enabled: true
+runtime:
+  device: cuda
+  dtype: float32
+  deterministic: true
+algorithm_overrides:
+  network:
+    architecture: mlp
+    hidden_layers:
+    - 128
+    - 128
+    - 128
+    - 128
+    activation:
+      name: tanh
+      parameters: {}
+    output_activation:
+      name: identity
+      parameters: {}
+    initialization:
+      name: xavier_normal
+      parameters: {}
+    input_transform:
+      name: none
+      parameters: {}
+    residual_connections:
+      enabled: false
+      parameters: {}
+    extra_parameters: {}
+  sampling:
+    interior:
+      strategy: uniform
+      parameters:
+        n_points: 5000
+    boundary:
+      strategy: uniform
+      parameters:
+        n_points: 256
+    initial:
+      strategy: uniform
+      parameters:
+        n_points: 256
+    adaptive_refinement:
+      enabled: false
+      strategy: residual_adaptive
+      parameters: {}
+  loss:
+    weighting_strategy:
+      name: fixed
+      parameters: {}
+    aggregation:
+      name: weighted_sum
+      parameters: {}
+  training:
+    batch_mode: full_batch
+    batch_size: null
+    gradient_clipping:
+      enabled: false
+      parameters: {}
+    early_stopping:
+      enabled: false
+      parameters: {}
+    time_strategy:
+      name: none
+      parameters: {}
+    initial_state_pretraining:
+      enabled: false
+      parameters: {}
+    extra_parameters:
+      adaptive_control:
+        enabled: false
+        freeze_lbfgs_objective: true
+        lbfgs_stall_recovery:
+          enabled: false
+          action: disabled
+        optimizer_phase_switch:
+          enabled: true
+          latest_lbfgs_entry_step: 14000
+          require_trial_completion: true
+        sampling_control:
+          enabled: false
+          strategy: none
+        curriculum_control:
+          enabled: false
+          strategy: none
+        rollback:
+          enabled: false
+      physics_validation:
+        enabled: true
+        strategy: fixed_component_probe
+        evaluation_interval: 500
+        normalization: warmup_envelope
+        normalization_calibration_observations: 3
+        minimum_component_scale: 0.001
+        category_aggregation: mean_active_physics_groups
+        points_per_component: 128
+        maximum_total_points: 4096
+        audit_enabled: true
+        audit_points_per_component: 2048
+        audit_maximum_total_points: 32768
+        audit_sampling_strategy: uniform
+        audit_seed_offset: 7919
+        second_order_degradation_ratio: 1.1
+        second_order_guard_metric: physics_validation_score
+      best_checkpoint:
+        enabled: true
+        selection_metric: physics_audit_score
+        final_model_policy: best_physics_validation
+        evaluation_interval: 500
+online_morphing:
+  enabled: true
+  decision_mode: llm_evolution
+  diagnostic_interval: 200
+  adaptation_freeze_step: 14000
+  block_new_morph_until_persistent_feedback: true
+  architecture_executor:
+    recovery_window_steps:
+      mild: 100
+      moderate: 250
+      strong: 500
+  policy_set:
+    enabled: true
+    population_size: 5
+    scoring:
+      temperature: 0.0
+    evolution:
+      enabled: true
+      maximum_llm_calls_per_run: 0
+      require_insufficient_progress: true
+      temperature: 0.7
+      offspring_per_generation: 5
+      maximum_attempts_per_mode: 5
+      maximum_transient_attempts_per_mode: 2
+      transient_retry_initial_seconds: 1.0
+      transient_retry_max_seconds: 4.0
+      minimum_valid_offspring: 5
+      maximum_applicability_repairs: 5
+  gradient_diagnostics:
+    persistence_windows: 2
+  preservation:
+    adaptive_strict_morphism_tolerance: true
+    adaptive_width_unit: 64
+    adaptive_depth_unit: 2
+    adaptive_first_derivative_tolerance_cap: 0.001
+    adaptive_second_derivative_tolerance_cap: 0.01
+  utility:
+    continuation_history_points: 7
+    continuation_minimum_confidence: 0.35
+    continuation_maximum_extrapolation_factor: 4.0
+    continuation_reject_clipped_forecast: true
+    minimum_trigger_observations: 3
+    short_horizon_steps: 100
+    medium_horizon_steps: 500
+    persistent_horizon_steps: 1000
+    retire_failed_additive_on_persistent: true
+    catastrophic_rollback_enabled: true
+    catastrophic_component_degradation_threshold: 3.0
+  allowed_primitives:
+  - WIDEN
+  - ADD_LAYER
+  - PRUNE
+  - REGROW
+  - REDISTRIBUTE
+  - LOCAL_REINIT
+  - ADD_RESIDUAL_BRANCH
+  - ADD_CORRECTION_BRANCH
+  - ADD_FOURIER_BRANCH
+  - ADD_GATED_BRANCH
+  - ADD_LOCALIZED_EXPERT
+  - ADD_ADAPTIVE_FOURIER_BRANCH
+  - ADD_COMPONENT_EXPERT
+  - REALLOCATE_COMPONENT_CAPACITY
+  - SPLIT_CONFLICTING_TOPOLOGY
+  - REBALANCE_LOSS_WEIGHTS
+  - BALANCE_COMPONENT_GRADIENTS
+  - REWEIGHT_RESIDUAL_REGIONS
+  - PROJECT_CONFLICTING_GRADIENTS
+  - EMPHASIZE_CONSTRAINTS
+  - MITIGATE_GRADIENT_CONFLICT
+  - ADAPT_SAMPLING_DISTRIBUTION
+  - ENTER_LBFGS_PHASE

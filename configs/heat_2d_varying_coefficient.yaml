@@ -1,0 +1,50 @@
+extends: base.yaml
+pde: heat_2d_varying_coefficient
+method: single_trajectory_eoh_policy_population
+algorithm_overrides:
+  optimization:
+    # Strong coefficient scaling and gradient imbalance need a long calibrated
+    # first-order residence; keep L-BFGS shorter to avoid amplifying imbalance.
+    phases:
+      - optimizer: adam
+        iterations: 14000
+        parameters: {learning_rate: 0.001}
+        scheduler: {name: none, parameters: {}}
+      - optimizer: lbfgs
+        iterations: 6000
+        parameters: {learning_rate: 1.0, history_size: 100, line_search_fn: strong_wolfe}
+        scheduler: {name: none, parameters: {}}
+  sampling:
+    # The heterogeneous boundary is substantially under-resolved by the
+    # generic 256-point default. Keep the global 12k point ceiling intact.
+    boundary: {strategy: uniform, parameters: {n_points: 2048}}
+    initial: {strategy: uniform, parameters: {n_points: 1024}}
+  loss:
+    # This benchmark starts with a 1e4--1e5 objective/gradient scale gap.
+    # Bounded component-gradient balancing calibrates and then updates only in
+    # first-order stages; the attained objective is frozen on L-BFGS entry.
+    weighting_strategy:
+      name: gradient_balance
+      parameters:
+        diagnostic_interval: 50
+        patience: 2
+        cooldown_iterations: 200
+        imbalance_threshold: 100.0
+        conflict_threshold: -0.1
+        minimum_weight: 0.01
+        maximum_weight: 100.0
+        minimum_update_ratio: 0.5
+        maximum_update_ratio: 2.0
+        alpha: 0.5
+        calibration_observations: 3
+        calibration_power: 1.0
+        calibration_use_fixed_probe: true
+  training:
+    extra_parameters:
+      adaptive_control:
+        enabled: true
+        freeze_lbfgs_objective: true
+        lbfgs_stall_recovery: {enabled: false, action: disabled}
+        sampling_control: {enabled: false, strategy: none}
+        curriculum_control: {enabled: false, strategy: none}
+        rollback: {enabled: false}

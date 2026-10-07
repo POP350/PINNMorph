@@ -1,0 +1,24 @@
+extends: base.yaml
+pde: poisson_2d_classic
+method: single_trajectory_eoh_policy_population
+algorithm_overrides:
+  constraint_enforcement:
+    method: problem_hard
+    transform_id: poisson_classic_dirichlet_exact
+    parameters: {}
+  optimization:
+    # Smooth elliptic residual minimization benefits from early full-batch
+    # L-BFGS once Adam reaches the basin.
+    phases:
+      - optimizer: adam
+        iterations: 14000
+        parameters: {learning_rate: 0.001}
+        scheduler: {name: none, parameters: {}}
+      - optimizer: lbfgs
+        iterations: 6000
+        parameters: {learning_rate: 1.0, history_size: 100, line_search_fn: strong_wolfe}
+        scheduler: {name: none, parameters: {}}
+  loss:
+    terms:
+      - {name: pde_residual, loss_function: mse, weight: 1.0, parameters: {}}
+      - {name: boundary_condition, loss_function: mse, weight: 10.0, parameters: {}}
