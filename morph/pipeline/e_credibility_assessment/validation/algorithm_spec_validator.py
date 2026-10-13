@@ -235,9 +235,9 @@ def normalize_algorithm_spec(spec: dict[str, Any]) -> dict[str, Any]:
                     "cooldown_iterations": 500,
                     "maximum_updates": 10,
                     "p95_to_median_threshold": 10.0,
-                    "replacement_fraction": 0.2,
-                    "hard_point_retention_fraction": 0.2,
-                    "random_exploration_fraction": 0.1,
+                    "replacement_fraction": 0.7,
+                    "hard_point_retention_fraction": 0.0,
+                    "random_exploration_fraction": 0.3,
                     "candidate_multiplier": 4,
                     "maximum_point_age": 20,
                     "maximum_consecutive_retention": 5,
@@ -329,7 +329,7 @@ def normalize_algorithm_spec(spec: dict[str, Any]) -> dict[str, Any]:
                         "ENTER_LBFGS_PHASE",
                     ],
                     "adaptation_freeze_step": 14000,
-                    "diagnostic_interval": 200,
+                    "diagnostic_interval": 400,
                     "minimum_iterations_before_morph": 400,
                     "cooldown_iterations": 400,
                     "plateau_window": 40,
@@ -816,6 +816,7 @@ def _validate_online_morphing(
         "enabled", "decision_mode", "allowed_primitives", "diagnostic_interval",
         "adaptive_strategy", "fourier_axis_frequencies",
         "adaptation_freeze_step", "block_new_morph_until_persistent_feedback",
+        "forced_initial_sampling_step",
         "minimum_iterations_before_morph", "cooldown_iterations",
         "plateau_window", "plateau_relative_improvement", "minimum_loss",
         "pde_dominance_ratio", "residual_concentration_ratio",
@@ -1194,6 +1195,7 @@ def _validate_online_morphing(
     for name in (
         "minimum_iterations_before_morph", "cooldown_iterations",
         "new_parameters_only_iterations",
+        "forced_initial_sampling_step",
         "min_steps_between_morphs",
         "activation_only_iterations",
         "min_remaining_iterations_for_morph",
@@ -1742,9 +1744,9 @@ def _validate_sampling_control(
         if sampling.get("enabled", False) and strategy == "none":
             _issue(errors, path, "POLICY_STATE_CONFLICT", "sampling strategy 'none' cannot be enabled")
         return
-    replacement = float(sampling.get("replacement_fraction", 0.2))
-    retention = float(sampling.get("hard_point_retention_fraction", 0.2))
-    exploration = float(sampling.get("random_exploration_fraction", 0.1))
+    replacement = float(sampling.get("replacement_fraction", 0.7))
+    retention = float(sampling.get("hard_point_retention_fraction", 0.0))
+    exploration = float(sampling.get("random_exploration_fraction", 0.3))
     if not 0.0 < replacement < 1.0:
         _issue(errors, f"{path}.replacement_fraction", "INVALID_SAMPLING_CONTROL_RATIO", "replacement_fraction must be in (0, 1)")
     if not 0.0 <= retention <= 1.0:
@@ -2090,7 +2092,7 @@ def _validate_component_control_extensions(
         path = f"{base}.best_checkpoint"
         allowed = {
             "enabled", "selection_metric", "final_model_policy",
-            "evaluation_interval",
+            "evaluation_interval", "initial_condition_guard",
         }
         if not isinstance(best, dict):
             _issue(errors, path, "INVALID_TYPE", "best_checkpoint must be an object")
@@ -2110,6 +2112,21 @@ def _validate_component_control_extensions(
                 _issue(errors, f"{path}.selection_metric", "INVALID_BEST_SELECTION_METRIC", "best_physics_validation requires selection_metric=physics_audit_score")
             if int(best.get("evaluation_interval", 100)) < 1:
                 _issue(errors, f"{path}.evaluation_interval", "INVALID_BEST_CHECKPOINT_PARAMETER", "evaluation_interval must be positive")
+            guard = best.get("initial_condition_guard")
+            if guard is not None:
+                guard_path = f"{path}.initial_condition_guard"
+                if not isinstance(guard, dict):
+                    _issue(errors, guard_path, "INVALID_TYPE", "initial_condition_guard must be an object")
+                else:
+                    unknown = sorted(set(guard) - {"enabled", "maximum_normalized_error"})
+                    if unknown:
+                        _issue(errors, guard_path, "UNSUPPORTED_INITIAL_CONDITION_GUARD_FIELD", f"Unsupported fields: {unknown}")
+                    if not isinstance(guard.get("enabled", True), bool):
+                        _issue(errors, f"{guard_path}.enabled", "INVALID_TYPE", "enabled must be boolean")
+                    limit = guard.get("maximum_normalized_error", 0.1)
+                    if (not isinstance(limit, (int, float)) or isinstance(limit, bool)
+                            or not math.isfinite(limit) or not 0.0 < limit <= 1.0):
+                        _issue(errors, f"{guard_path}.maximum_normalized_error", "INVALID_INITIAL_CONDITION_GUARD_LIMIT", "maximum_normalized_error must be in (0, 1]")
 
     forbidden = ("reference", "evaluator", "l1re", "l2re", "amplitude", "phase", "spectrum_error", "network_layers", "activation", "output_transform", "add_loss", "remove_loss", "pde_residual")
 

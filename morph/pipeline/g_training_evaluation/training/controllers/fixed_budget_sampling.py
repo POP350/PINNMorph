@@ -5,6 +5,11 @@ from __future__ import annotations
 from typing import Any
 
 from .state import ReplaceSamplingSubsetAction, TrainerObservableState
+from ..sampling_runtime import (
+    FIXED_PDE_GLOBAL_FRACTION,
+    FIXED_PDE_LOCAL_FRACTION,
+    fixed_pde_cloud_counts,
+)
 
 
 DEFAULTS: dict[str, Any] = {
@@ -16,9 +21,9 @@ DEFAULTS: dict[str, Any] = {
     "cooldown_iterations": 500,
     "maximum_updates": 10,
     "p95_to_median_threshold": 10.0,
-    "replacement_fraction": 0.20,
-    "hard_point_retention_fraction": 0.20,
-    "random_exploration_fraction": 0.10,
+    "replacement_fraction": FIXED_PDE_LOCAL_FRACTION,
+    "hard_point_retention_fraction": 0.0,
+    "random_exploration_fraction": FIXED_PDE_GLOBAL_FRACTION,
     "candidate_multiplier": 4,
     "maximum_point_age": 20,
     "maximum_consecutive_retention": 5,
@@ -37,6 +42,11 @@ class FixedBudgetSamplingController:
 
     def __init__(self, config: dict[str, Any] | None = None) -> None:
         self.config = {**DEFAULTS, **dict(config or {})}
+        self.config.update(
+            replacement_fraction=FIXED_PDE_LOCAL_FRACTION,
+            hard_point_retention_fraction=0.0,
+            random_exploration_fraction=FIXED_PDE_GLOBAL_FRACTION,
+        )
         self.patience_counts: dict[str, int] = {}
         self.last_action_iteration: int | None = None
         self.update_count = 0
@@ -96,7 +106,8 @@ class FixedBudgetSamplingController:
             return dict(self.last_observation)
         _, sampler_id, diagnostic = sorted(candidates, key=lambda item: (-item[0], item[1]))[0]
         point_count = int(diagnostic["point_count"])
-        replacement_count = max(1, int(point_count * float(self.config["replacement_fraction"])))
+        local_count, _ = fixed_pde_cloud_counts(point_count)
+        replacement_count = max(1, local_count)
         candidate_count = max(
             replacement_count,
             replacement_count * int(self.config["candidate_multiplier"]),

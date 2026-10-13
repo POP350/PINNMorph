@@ -114,10 +114,14 @@ algorithm_overrides:
         selection_metric: physics_audit_score
         final_model_policy: best_physics_validation
         evaluation_interval: 500
+        initial_condition_guard:
+          enabled: true
+          maximum_normalized_error: 0.1
 online_morphing:
   enabled: true
   decision_mode: llm_evolution
-  diagnostic_interval: 200
+  diagnostic_interval: 400
+  forced_initial_sampling_step: 200
   adaptation_freeze_step: 14000
   block_new_morph_until_persistent_feedback: true
   architecture_executor:
@@ -132,6 +136,7 @@ online_morphing:
       temperature: 0.0
     evolution:
       enabled: true
+      # Unlimited online requests; generation/scoring/retry counts are still recorded.
       maximum_llm_calls_per_run: 0
       require_insufficient_progress: true
       temperature: 0.7

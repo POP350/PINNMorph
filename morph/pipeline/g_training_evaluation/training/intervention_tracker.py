@@ -6,7 +6,8 @@ from copy import deepcopy
 from dataclasses import asdict, dataclass, field
 from typing import Any, Mapping
 
-from .adaptation_program import AdaptationProgram
+from .adaptation_program import AdaptationProgram, SAMPLING_ACTIONS
+from .rollback_whitelist import is_rollback_whitelisted
 
 
 FEEDBACK_HORIZONS = {"short": 100, "medium": 500, "persistent": 1000}
@@ -20,15 +21,18 @@ class InterventionRecord:
     state_id: str
     program: Mapping[str, Any]
     start_step: int
-    short_due_step: int
-    medium_due_step: int
-    persistent_due_step: int
+    short_due_step: int | None
+    medium_due_step: int | None
+    persistent_due_step: int | None
     short_feedback: Mapping[str, Any] | None = None
     medium_feedback: Mapping[str, Any] | None = None
     persistent_feedback: Mapping[str, Any] | None = None
+    feedback_exempt: bool = False
+    rollback_allowed: bool = True
+    executed_primitives: tuple[str, ...] = ()
 
     def feedback_complete(self) -> bool:
-        return self.persistent_feedback is not None
+        return self.feedback_exempt or self.persistent_feedback is not None
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -56,11 +60,13 @@ class InterventionTracker:
         program: AdaptationProgram,
         start_step: int,
         state_before: Mapping[str, Any],
+        executed_primitives: tuple[str, ...] = (),
     ) -> InterventionRecord:
         if not program.has_intervention():
             raise ValueError("KEEP programs do not create interventions")
         self._sequence += 1
         intervention_id = f"intervention-{int(start_step):08d}-{self._sequence:05d}"
+        feedback_exempt = program.action in SAMPLING_ACTIONS
         record = InterventionRecord(
             intervention_id=intervention_id,
             policy_id=str(policy_id),
@@ -68,9 +74,14 @@ class InterventionTracker:
             state_id=str(state_id),
             program=program.to_dict(),
             start_step=int(start_step),
-            short_due_step=int(start_step) + int(self.horizons["short"]),
-            medium_due_step=int(start_step) + int(self.horizons["medium"]),
-            persistent_due_step=int(start_step) + int(self.horizons["persistent"]),
+            short_due_step=None if feedback_exempt else int(start_step) + int(self.horizons["short"]),
+            medium_due_step=None if feedback_exempt else int(start_step) + int(self.horizons["medium"]),
+            persistent_due_step=None if feedback_exempt else int(start_step) + int(self.horizons["persistent"]),
+            feedback_exempt=feedback_exempt,
+            rollback_allowed=not is_rollback_whitelisted({
+                "program": program.to_dict(), "executed_primitives": executed_primitives,
+            }),
+            executed_primitives=executed_primitives,
         )
         self.records[intervention_id] = record
         self.shared_history.append(
@@ -83,6 +94,8 @@ class InterventionTracker:
                 "program": program.to_dict(),
                 "start_step": int(start_step),
                 "feedback": {},
+                "feedback_exempt": feedback_exempt,
+                "rollback_allowed": record.rollback_allowed,
             }
         )
         return record
@@ -91,6 +104,8 @@ class InterventionTracker:
         result: list[tuple[str, str]] = []
         current = int(step)
         for record in self.records.values():
+            if record.feedback_exempt:
+                continue
             for horizon in ("short", "medium", "persistent"):
                 if getattr(record, f"{horizon}_feedback") is not None:
                     continue
@@ -110,6 +125,17 @@ class InterventionTracker:
         if horizon not in FEEDBACK_HORIZONS:
             raise ValueError(f"Unknown feedback horizon: {horizon}")
         record = self.records[intervention_id]
+        if record.feedback_exempt:
+            return {
+                "intervention_id": intervention_id,
+                "policy_id": record.policy_id,
+                "policy_version": record.policy_version,
+                "state_id": record.state_id,
+                "horizon": horizon,
+                "feedback": {"feedback_status": "whitelisted", "credit_eligible": False},
+                "recorded": False,
+                "feedback_exempt": True,
+            }
         attribute = f"{horizon}_feedback"
         existing = getattr(record, attribute)
         if existing is not None:
@@ -147,6 +173,8 @@ class InterventionTracker:
         for index, item in enumerate(self.shared_history, start=1):
             if index <= int(last_consumed_sequence):
                 continue
+            if item.get("feedback_exempt", False):
+                continue
             feedback = dict(item.get("feedback") or {})
             if "medium" in feedback or "persistent" in feedback:
                 return True
@@ -173,6 +201,22 @@ class InterventionTracker:
             for key, value in dict(payload.get("records") or {}).items()
         }
         self.shared_history = deepcopy(list(payload.get("shared_history") or []))
+        for record in self.records.values():
+            record.rollback_allowed = not is_rollback_whitelisted({
+                "program": record.program, "executed_primitives": record.executed_primitives,
+            })
+            # Previously saved sampling trials must not resume delayed checks.
+            if AdaptationProgram.from_dict(record.program).action in SAMPLING_ACTIONS:
+                record.feedback_exempt = True
+                record.short_due_step = None
+                record.medium_due_step = None
+                record.persistent_due_step = None
+        for item in self.shared_history:
+            record = self.records.get(str(item.get("intervention_id") or ""))
+            if record is not None and record.feedback_exempt:
+                item["feedback_exempt"] = True
+            if record is not None:
+                item["rollback_allowed"] = record.rollback_allowed
         self._sequence = int(payload.get("sequence", len(self.records)))
 
 

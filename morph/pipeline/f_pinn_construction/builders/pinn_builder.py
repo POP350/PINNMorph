@@ -15,7 +15,7 @@ from copy import deepcopy
 from dataclasses import asdict, dataclass, field, replace
 import inspect
 import math
-from typing import Any, Callable
+from typing import Any, Callable, Mapping
 
 import torch
 from torch import nn
@@ -2642,6 +2642,30 @@ class ConstraintOutputWrapper(nn.Module):
     def forward(self, inputs: torch.Tensor) -> torch.Tensor:
         return self.transform(inputs, self.model(inputs))
 
+    def architecture_state(self) -> list[dict[str, Any]]:
+        """Expose the wrapped model's topology for complete checkpoints."""
+
+        snapshot = getattr(self.model, "architecture_state", None)
+        return deepcopy(list(snapshot())) if callable(snapshot) else []
+
+    def restore_architecture(self, specs: list[Mapping[str, Any]] | None) -> None:
+        """Rebuild the inner topology before loading ``model.`` tensors.
+
+        Missing metadata from a legacy checkpoint is not evidence that the
+        checkpoint had no interventions. Only an explicit empty list restores
+        the original topology; the problem-owned output transform stays intact.
+        """
+
+        if specs is None:
+            return
+        restore = getattr(self.model, "restore_architecture", None)
+        if callable(restore):
+            restore(deepcopy(specs))
+        elif specs:
+            raise RuntimeError(
+                "Constraint-wrapped model cannot restore dynamic architecture state"
+            )
+
 
 class BoundsTransform(nn.Module):
     def __init__(self, lower: torch.Tensor, upper: torch.Tensor) -> None:
@@ -3585,6 +3609,7 @@ class OpenSpecSampler:
         self.sampling_budget_plan: Any | None = None
         self._temporal_variable_index: int | None = None
         self._loss_runtime: Any | None = None
+        self._training_model: nn.Module | None = None
         self._controlled_sampling_points: dict[str, torch.Tensor] = {}
         self._latest_sampling_points: dict[str, torch.Tensor] = {}
         self._sampling_point_metadata: dict[str, list[dict[str, Any]]] = {}
@@ -3683,6 +3708,11 @@ class OpenSpecSampler:
     def set_loss_runtime(self, loss_runtime: Any) -> None:
         self._loss_runtime = loss_runtime
 
+    def set_training_model(self, model: nn.Module) -> None:
+        """Enable residual selection for training clouds, leaving probes unbound."""
+
+        self._training_model = model
+
     def probe_clone(self) -> "OpenSpecSampler":
         clone = OpenSpecSampler(
             self.problem,
@@ -3732,6 +3762,19 @@ class OpenSpecSampler:
                     "fraction": value,
                 }
             )
+        if value != self.time_window_fraction:
+            sampler_ids = {
+                item.sampler_id
+                for item in getattr(self.component_registry, "sampling_components", ())
+                if item.domain_role == "interior"
+            } or {"sample:interior"}
+            for sampler_id in sampler_ids:
+                self._controlled_sampling_points.pop(sampler_id, None)
+                self._latest_sampling_points.pop(sampler_id, None)
+                self._sampling_point_metadata.pop(sampler_id, None)
+                self._sampling_state_versions[sampler_id] = int(
+                    self._sampling_state_versions.get(sampler_id, 0)
+                ) + 1
         self.time_window_fraction = value
 
     def refresh_curriculum_samplers(
@@ -3966,12 +4009,17 @@ class OpenSpecSampler:
             else "sample:interior"
         )
         controlled = self._controlled_sampling_points.get(interior_sampler_id)
+        if controlled is None:
+            controlled = self._latest_sampling_points.get(interior_sampler_id)
         if controlled is not None and int(controlled.shape[0]) == max(1, interior_n):
             domain = controlled.detach().clone().to(self.device)
         else:
-            domain = self._apply_time_window_to_tensor(
-                self._domain(max(1, interior_n))
+            domain = self._initialize_fixed_pde_cloud(
+                interior_sampler_id,
+                max(1, interior_n),
+                interior_descriptor,
             )
+            self._controlled_sampling_points[interior_sampler_id] = domain.detach().clone()
         self._latest_sampling_points[interior_sampler_id] = domain.detach().clone()
         if interior_sampler_id not in self._sampling_point_metadata or len(
             self._sampling_point_metadata[interior_sampler_id]
@@ -4049,6 +4097,41 @@ class OpenSpecSampler:
         self._record_sampling_snapshot(batch)
         return batch
 
+    def _initialize_fixed_pde_cloud(
+        self, sampler_id: str, count: int, descriptor: Any | None
+    ) -> torch.Tensor:
+        from morph.pipeline.g_training_evaluation.training.sampling_runtime import (
+            fixed_pde_cloud_counts,
+        )
+
+        local_count, global_count = fixed_pde_cloud_counts(count)
+        # Probe clones intentionally have no training model: their coordinates
+        # must remain held out from the model-selected training cloud.
+        if self._training_model is None:
+            return self._apply_time_window_to_tensor(self._domain(count))
+        if descriptor is None or self._loss_runtime is None:
+            raise RuntimeError("Fixed PDE cloud selection requires registered PDE scoring")
+        if local_count:
+            candidates = self.generate_candidate_points(sampler_id, local_count * 4)
+            with torch.enable_grad():
+                scored = self.score_points(
+                    self._training_model,
+                    tuple(descriptor.associated_loss_component_ids),
+                    candidates,
+                    None,
+                )
+            selected = torch.argsort(scored.scores, descending=True)[:local_count]
+            local = candidates.points[selected.to(candidates.points.device)]
+        global_points = self.generate_candidate_points(sampler_id, global_count).points
+        if not local_count:
+            local = global_points[:0]
+        domain = torch.cat((local, global_points), dim=0).detach().clone()
+        metadata = self._new_point_metadata(count, origin="initial")
+        for index, item in enumerate(metadata):
+            item["sampling_scope"] = "local" if index < local_count else "global"
+        self._sampling_point_metadata[sampler_id] = metadata
+        return domain
+
     def _new_point_metadata(self, count: int, *, origin: str) -> list[dict[str, Any]]:
         result = []
         for _ in range(int(count)):
@@ -4118,9 +4201,22 @@ class OpenSpecSampler:
 
         if self._loss_runtime is None:
             raise RuntimeError("Sampling point scoring requires a registered loss runtime")
-        raw = self._loss_runtime.compute_pointwise_component_scores(
-            model, tuple(component_ids), points.points
-        )
+        component_chunks: dict[str, list[torch.Tensor]] = {}
+        # Higher-order PDEs build large derivative graphs even for detached
+        # scores. Bound each graph, then normalize over the whole point pool.
+        for offset in range(0, points.point_count, 1024):
+            chunk = self._loss_runtime.compute_pointwise_component_scores(
+                model, tuple(component_ids), points.points[offset:offset + 1024]
+            )
+            for component_id in chunk:
+                component_chunks.setdefault(str(component_id), []).append(
+                    chunk[component_id].detach().reshape(-1).float().cpu()
+                )
+            del chunk
+        raw = {
+            component_id: torch.cat(chunks, dim=0)
+            for component_id, chunks in component_chunks.items()
+        }
         normalized = []
         for component_id in sorted(raw):
             values = raw[component_id].detach().reshape(-1).float()
@@ -4192,8 +4288,10 @@ class OpenSpecSampler:
         replacement = replacement_points.points.detach().clone().to(self.device)
         if len(set(retained)) != len(retained) or any(index < 0 or index >= current.point_count for index in retained):
             raise ValueError("Retained indices must be unique and in range")
-        if len(retained) + int(replacement.shape[0]) != current.point_count:
-            raise ValueError("Fixed-budget replacement must preserve point count")
+        if retained and len(retained) + int(replacement.shape[0]) != current.point_count:
+            raise ValueError("Partial replacement must preserve point count")
+        if not retained and int(replacement.shape[0]) <= 0:
+            raise ValueError("A complete sampling replacement must contain at least one point")
         before_version = int(self._sampling_state_versions.get(str(sampler_id), 0))
         retained_tensor = current.points[retained].to(self.device)
         combined = torch.cat((retained_tensor, replacement), dim=0)
@@ -4220,6 +4318,10 @@ class OpenSpecSampler:
         exploration_count = int(context.get("exploration_count", 0))
         for item in new_metadata[-exploration_count:] if exploration_count else ():
             item["origin"] = "exploration"
+        if not retained and exploration_count:
+            local_count = int(replacement.shape[0]) - exploration_count
+            for index, item in enumerate(new_metadata):
+                item["sampling_scope"] = "local" if index < local_count else "global"
         self._controlled_sampling_points[str(sampler_id)] = combined
         self._latest_sampling_points[str(sampler_id)] = combined.detach().clone()
         self._sampling_point_metadata[str(sampler_id)] = retained_metadata + new_metadata
@@ -4426,6 +4528,17 @@ class OpenSpecSampler:
                 else None
             ),
             "training_residual_regions": region_snapshot,
+            "pde_cloud_fixed": True,
+            "pde_cloud_local_points": sum(
+                item.get("sampling_scope") == "local"
+                for metadata in self._sampling_point_metadata.values()
+                for item in metadata
+            ),
+            "pde_cloud_global_points": sum(
+                item.get("sampling_scope") == "global"
+                for metadata in self._sampling_point_metadata.values()
+                for item in metadata
+            ),
         }
         if self.maximum_sampling_points is not None and total > self.maximum_sampling_points:
             raise RuntimeError(
@@ -4519,35 +4632,6 @@ class OpenSpecSampler:
         )
         if callable(balance):
             base = balance(base)
-        if not self.adaptive_points:
-            return base
-        adaptive = torch.cat(self.adaptive_points, dim=0).to(self.device)
-        region_ids = getattr(
-            self.problem, "training_residual_region_ids", None
-        )
-        if callable(region_ids):
-            base_regions = region_ids(base)
-            adaptive_regions = region_ids(adaptive)
-            if isinstance(base_regions, torch.Tensor) and isinstance(
-                adaptive_regions, torch.Tensor
-            ):
-                result = base.clone()
-                for region in torch.unique(adaptive_regions).tolist():
-                    base_indices = torch.nonzero(
-                        base_regions == int(region), as_tuple=False
-                    ).reshape(-1)
-                    region_points = adaptive[
-                        adaptive_regions == int(region)
-                    ]
-                    count = min(
-                        int(base_indices.numel()),
-                        int(region_points.shape[0]),
-                    )
-                    if count > 0:
-                        result[base_indices[-count:]] = region_points[-count:]
-                return result
-        count = min(n, adaptive.shape[0])
-        base[-count:] = adaptive[-count:]
         return base
 
     def _latin_hypercube(self, n: int) -> torch.Tensor:
@@ -4648,17 +4732,35 @@ class OpenSpecSampler:
         return lower_bounds, upper_bounds
 
     def adaptive_update(self, model: nn.Module) -> None:
+        from morph.pipeline.g_training_evaluation.training.sampling_runtime import (
+            SamplingBatch,
+            fixed_pde_cloud_counts,
+        )
+
         adaptive = self.spec["adaptive_refinement"]
         if not adaptive.get("enabled"):
             return
         parameters = adaptive.get("parameters") or {}
         initial_interior_points = int(
-            (self.spec.get("interior", {}).get("parameters") or {}).get("n_points") or 0
+            self._runtime_sample_count_overrides.get(
+                "interior",
+                (self.spec.get("interior", {}).get("parameters") or {}).get("n_points") or 0,
+            )
         )
+        local_count, global_count = fixed_pde_cloud_counts(max(1, initial_interior_points))
+        descriptor = next(
+            (
+                item for item in getattr(self.component_registry, "sampling_components", ())
+                if item.domain_role == "interior"
+            ),
+            None,
+        )
+        sampler_id = str(descriptor.sampler_id) if descriptor is not None else "sample:interior"
+        if sampler_id not in self._latest_sampling_points:
+            self.sample()
         adaptive_points_before = sum(int(points.shape[0]) for points in self.adaptive_points)
-        candidate_count = int(parameters.get("candidate_points", 1024))
-        add_points = int(parameters.get("add_points", 64))
-        candidates = self.problem.sample_domain(max(candidate_count, add_points), device=self.device)
+        candidate_count = max(int(parameters.get("candidate_points", 1024)), local_count * 4, 1)
+        candidates = self.generate_candidate_points(sampler_id, candidate_count).points
         candidates = candidates.detach().clone().requires_grad_(True)
         strategy = adaptive.get("strategy") or "residual_adaptive"
         needs_gradient = strategy in {"gradient_adaptive", "hybrid_adaptive"}
@@ -4747,8 +4849,10 @@ class OpenSpecSampler:
                     )
         else:
             scores = residual_score
-        selection_count = min(add_points, candidates.shape[0])
-        if strategy in {"rad", "rar_d"}:
+        selection_count = local_count
+        if not selection_count:
+            selected = torch.empty(0, dtype=torch.long, device=candidates.device)
+        elif strategy in {"rad", "rar_d"}:
             exponent = float(parameters.get("residual_exponent", 2.0))
             offset = float(parameters.get("distribution_offset", 1.0))
             weights = scores.clamp_min(0.0).pow(exponent)
@@ -4758,16 +4862,19 @@ class OpenSpecSampler:
         else:
             selected = torch.topk(scores, k=selection_count).indices
         selected_points = candidates.detach()[selected].clone()
-        replace_existing = bool(parameters.get("replace_existing", strategy == "rad"))
-        if replace_existing:
-            self.adaptive_points = [selected_points]
-        else:
-            self.adaptive_points.append(selected_points)
+        self.adaptive_points = [selected_points]
         max_points = int(parameters.get("max_points", 0))
-        if max_points > 0:
-            combined = torch.cat(self.adaptive_points, dim=0)
-            if combined.shape[0] > max_points:
-                self.adaptive_points = [combined[-max_points:].detach().clone()]
+        global_points = self.generate_candidate_points(sampler_id, global_count).points
+        self.replace_subset(
+            sampler_id,
+            (),
+            SamplingBatch(
+                sampler_id=sampler_id,
+                points=torch.cat((selected_points, global_points), dim=0),
+            ),
+            exploration_count=global_count,
+            iteration=self._sample_call_count,
+        )
         adaptive_points_after = sum(int(points.shape[0]) for points in self.adaptive_points)
         current_interior_points = initial_interior_points
         boundary_points = int(
@@ -4793,9 +4900,12 @@ class OpenSpecSampler:
             "available_residual_components": [str(name) for name in residuals],
             "max_points": max_points,
             "max_points_semantics": (
-                "maximum stored adaptive replacement points; adaptive points replace positions "
-                "inside the fixed interior batch and do not increase current_interior_points"
+                "legacy max_points does not alter the fixed PDE quota; each refinement "
+                "rebuilds the configured local/global allocation at the same total budget"
             ),
+            "local_points": local_count,
+            "global_points": global_count,
+            "pde_cloud_fixed": True,
             "maximum_sampling_points": self.maximum_sampling_points,
         }
         self.adaptive_refinement_events.append(event)
@@ -5038,11 +5148,21 @@ class OpenSpecLoss:
         }
 
     def configure_online_gradnorm(
-        self, *, strength: float, update_every: int = 10
+        self, *, strength: float, update_every: int = 10,
+        minimum_weight: float = 0.01, maximum_weight: float = 100.0,
     ) -> None:
+        minimum = float(minimum_weight)
+        maximum = float(maximum_weight)
+        if not (
+            math.isfinite(minimum) and math.isfinite(maximum)
+            and 0.0 < minimum <= maximum
+        ):
+            raise ValueError("Online gradient weight bounds must be finite, positive and ordered")
         self._online_gradnorm = {
             "strength": min(1.0, max(0.0, float(strength))),
             "update_every": max(1, int(update_every)),
+            "minimum_weight": minimum,
+            "maximum_weight": maximum,
         }
 
     def _online_time_weighted_value(self, residual, domain, default):
@@ -5653,28 +5773,33 @@ class OpenSpecLoss:
         if online_gradnorm and not self._dynamic_updates_frozen and len(values) >= 2:
             self._online_gradnorm_calls += 1
             update_every = max(1, int(online_gradnorm.get("update_every", 10)))
+            minimum = float(online_gradnorm.get("minimum_weight", 0.01))
+            maximum = float(online_gradnorm.get("maximum_weight", 100.0))
+            weights = weights.clamp(minimum, maximum)
             if self._online_gradnorm_calls % update_every == 0:
                 statistics = torch.stack(
                     [self._gradient_stat(value, model, mode="mean") for value in values]
-                ).detach().clamp_min(1.0e-12)
-                target = statistics.median()
+                ).detach()
+                valid = torch.isfinite(statistics) & (statistics > 0.0)
                 strength = float(online_gradnorm.get("strength", 0.5))
-                ratios = (target / statistics).pow(strength).clamp(0.25, 4.0)
-                weights = (weights * ratios).clamp(1.0e-8, 1.0e6)
-                self._runtime_base_weights.update(
-                    {
-                        name: float(weight.detach().cpu())
-                        for name, weight in zip(names, weights)
-                    }
-                )
+                updated = int(valid.sum().item()) >= 2
+                if updated:
+                    # Balance actual weighted contributions. Repeated ratios
+                    # from raw gradients alone compound forever, even after
+                    # the effective gradients have already become balanced.
+                    log_contributions = statistics[valid].log() + weights[valid].log()
+                    log_ratios = (log_contributions.mean() - log_contributions) * strength
+                    ratios = log_ratios.clamp(math.log(0.25), math.log(4.0)).exp()
+                    weights[valid] = weights[valid] * ratios
+                    weights = weights.clamp(minimum, maximum)
                 self.last_dynamic_weighting = {
                     "strategy": "online_gradnorm",
-                    "updated": True,
+                    "updated": updated,
                     "gradient_statistics": {
-                        name: float(value.cpu())
+                        name: float(value.cpu()) if torch.isfinite(value) else None
                         for name, value in zip(names, statistics)
                     },
-                    "effective_weights": dict(self._runtime_base_weights),
+                    "gradient_measure": "weighted_component_gradient_mean",
                 }
             else:
                 self.last_dynamic_weighting = {
@@ -5682,6 +5807,17 @@ class OpenSpecLoss:
                     "updated": False,
                     "update_every": update_every,
                 }
+            self._runtime_base_weights.update(
+                {
+                    name: float(weight.detach().cpu())
+                    for name, weight in zip(names, weights)
+                }
+            )
+            self.last_dynamic_weighting.update({
+                "minimum_weight": minimum,
+                "maximum_weight": maximum,
+                "effective_weights": dict(self._runtime_base_weights),
+            })
         if self._dynamic_updates_frozen:
             if tuple(names) != tuple(self._frozen_term_names or ()):
                 raise RuntimeError("Loss-term membership changed during frozen L-BFGS phase")
@@ -6244,6 +6380,7 @@ class PINNBuilder:
         )
         loss_function = self._build_loss(normalized["loss"], problem, sampler)
         sampler.set_loss_runtime(loss_function)
+        sampler.set_training_model(model)
         phases = self._build_optimization_phases(normalized["optimization"], model)
         try:
             sampling_budget_plan = resolve_sampling_budget_plan(

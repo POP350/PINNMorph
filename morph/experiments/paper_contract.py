@@ -32,7 +32,14 @@ def validate_paper_protocol(config):
                          ("audit_points_per_component", 2048), ("audit_maximum_total_points", 32768)):
         require(physics[field] == value, f"held-out probe budget {field} (B.3)")
     require(physics["audit_enabled"], "independent audit set (B.3)")
+    initial_guard = training["extra_parameters"]["best_checkpoint"].get("initial_condition_guard", {})
+    require(initial_guard.get("enabled") is True
+            and initial_guard.get("maximum_normalized_error") == 0.1,
+            "best-checkpoint IC eligibility is matched across variants")
     online = config["online_morphing"]
+    expected_sampling_step = 200 if config.get("ablation_mode", "none") == "none" else 0
+    require(online.get("forced_initial_sampling_step", 200) == expected_sampling_step,
+            "mandatory step-200 sampling is Full-only")
     require(config.get("capability_ablation") == "none", "complete action library (C.1)")
     require(tuple(online["allowed_primitives"]) == PRIMITIVE_LIBRARY, "all 23 primitives (C.1)")
     require("fourier_axis_frequencies" not in online, "no PDE-specific Fourier bank override (C.1)")
@@ -41,7 +48,7 @@ def validate_paper_protocol(config):
             "no extra candidate-family restrictions or influence ramps")
     for field in ("temporal", "trial_control", "influence_guard", "llm_efficiency"):
         require(not (adaptive.get(field) or {}).get("enabled"), f"unreported extension {field} disabled")
-    for field, value in (("diagnostic_interval", 200), ("minimum_iterations_before_morph", 400),
+    for field, value in (("diagnostic_interval", 400), ("minimum_iterations_before_morph", 400),
                          ("adaptation_freeze_step", 14000), ("activation_only_iterations", 10),
                          ("new_parameters_only_iterations", 50)):
         require(online[field] == value, f"schedule {field} (B.2)")

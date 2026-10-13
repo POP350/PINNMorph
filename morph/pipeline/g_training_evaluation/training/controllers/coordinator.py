@@ -17,6 +17,9 @@ DEFAULT_PRIORITY = (
     "curriculum",
 )
 SAFETY_ACTIONS = frozenset({"rollback", "terminate_candidate"})
+SAMPLING_POST_ACTION_WHITELIST = frozenset({
+    "replace_sampling_subset", "update_sampling_allocation",
+})
 ACTION_PRIORITY_CATEGORY = {
     "rollback": "rollback",
     "terminate_candidate": "terminate_candidate",
@@ -147,7 +150,11 @@ class ControllerCoordinator:
         iteration: int,
         outcome: str,
     ) -> None:
-        if outcome == "applied" and action.action_type not in SAFETY_ACTIONS:
+        if (
+            outcome == "applied"
+            and action.action_type not in SAFETY_ACTIONS
+            and action.action_type not in SAMPLING_POST_ACTION_WHITELIST
+        ):
             self.last_non_safety_action_iteration = int(iteration)
             self.extend_observation_window(
                 int(iteration) + self.observation_window_iterations

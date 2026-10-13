@@ -5,6 +5,22 @@ Run these commands from the project root in your Python environment.
 The Python package is `morph`. Benchmark configurations live in `configs/`.
 The bundled PINNacle runtime and reference data in `third_party/` are required.
 
+PDE collocation uses a fixed point cloud. The initial cloud defaults to 70% local high-residual points and 30% independent full-domain points. At step 200, only Full makes one mandatory generation-LLM request for a sampling plan and applies it directly, without candidate scoring, a plateau gate or utility approval. The LLM chooses the local/global allocation and total point count freely; neither the 70/30 default nor configured point-count limit constrains an explicit LLM plan. Coordinates stay fixed between explicit sampling or curriculum actions. Sampling creates no post-action validation, delayed utility trial, observation window or rollback. A provider/format/runtime failure is reported instead of silently converting this mandatory action to KEEP.
+
+Ordinary online sampling returns KEEP for an already active policy: identical region, local/global allocation and candidate multiplier do not regenerate points under a different ID, strength, selector, wording or cooldown. Changing these effective parameters replaces the current policy; an earlier policy can be selected again after switching away. The mandatory Full-only step-200 action bypasses this ordinary gate once. Both the active policy and mandatory-action status survive checkpoints. Whitelisted means applied without utility validation, never proven benefit.
+
+Committed Loss Reweighting, Adaptive Sampling, Gradient Adjustment, Residual/Fourier Branch, and Localized Expert actions are exempt from feedback-driven rollback, weight restoration, and branch retirement. Loss, gradient, and architecture actions still record delayed feedback for policy learning; sampling retains its feedback exemption. Other action families keep their existing rollback behavior.
+
+Online component-gradient balancing uses the current weighted gradient contributions and enforces the LLM's `minimum_weight` and `maximum_weight` on every dynamic update. These bounds survive checkpoints, and the resulting weights stay frozen throughout L-BFGS.
+
+Sampling prompts prioritize full-domain coverage and require spatial evidence for increasing the local fraction. IC dominance or gradient conflict alone does not demonstrate localized PDE error, and PDE-cloud changes leave the IC/BC point pools unchanged. This advice is shared by generation, scoring, tie-breaking and the mandatory step-200 request; the LLM still chooses the allocation freely.
+
+Physics-checkpoint selection first requires every registered initial-condition component on the independent audit set to have normalized residual MSE at most `0.1` of its calibrated warmup baseline. The limit is configurable under `best_checkpoint.initial_condition_guard.maximum_normalized_error` and is matched across variants. Eligible candidates are ranked by the existing physics audit score. PDEs without initial conditions keep the original ranking; if no candidate qualifies, the final model is the last optimizer state and the report records the fallback. Selection uses no reference-solution MSE or L2 metrics and does not roll back Morph actions.
+
+Poisson Classic uses soft boundary penalties in every variant: the outer square target remains 1, the circular-hole targets remain 0, and the configured boundary loss weight is 10. The default profile applies no hard output lifting. KS keeps its exact initial-condition transform; its output wrapper preserves dynamic architecture snapshots when saving and restoring checkpoints.
+
+Online LLM requests have no per-run call-count cap by default (`online_morphing.policy_set.evolution.maximum_llm_calls_per_run: 0`). Policy generation, scoring, retries, and tie-breaks continue beyond 38 requests when the existing online adaptation rules permit them. Request counts still survive checkpoint resume. A positive value explicitly enables an optional shared cap; only then does generation reserve calls for independent scoring and an exhausted cap produce KEEP decisions. Connectivity preflight requests are counted separately. Prompts use compact JSON, one capability contract, at most three recent causal records, complete assigned parents, and summaries of other policies; scoring includes only the capabilities actually proposed.
+
 ## 1. Install dependencies
 
 Use Python 3.11. Install a PyTorch build compatible with your CUDA environment, then install the project dependencies:
@@ -168,32 +184,6 @@ python scripts/run_benchmarks.py --summary-only --results-root results/burgers_1
 ```
 
 Use `python scripts/run_benchmarks.py --help` to view available arguments.
-
-## Server integration check: GPUs 1, 2 and 3
-
-On a server where GPU 0 must remain unused, this optional script runs all 13 PDEs with seed 0 and the `full` variant. It runs at most three tasks on each of GPUs 1, 2 and 3, for nine tasks in total. It keeps 20,000 steps and the paper method settings so the run can exercise adaptation, delayed feedback and the optimizer phases. This is a single-seed integration check, not a five-run reproduction.
-
-First validate without training or provider requests:
-
-```bash
-bash scripts/run_server_check.sh --dry-run --results-root results/server_check_seed0
-```
-
-Then run in your configured Python environment:
-
-```bash
-bash scripts/run_server_check.sh --results-root results/server_check_seed0
-```
-
-For a background run that survives disconnecting from SSH:
-
-```bash
-nohup bash scripts/run_server_check.sh --results-root results/server_check_seed0 > server_check.out 2>&1 &
-```
-
-Choose either the foreground or background command. Follow progress with `tail -f server_check.out` for the background run. Individual logs are in `full/_launcher_logs/`; the final summary is `comparison_summary.md`. Each `run_summary.json` records failures, solution errors, actual optimizer steps, run time, peak memory, interventions and LLM calls. Do not interpret simultaneous task times as isolated performance measurements.
-
-Rerun the same command and results root to resume. Automatic clean retries are disabled so failed attempts remain available for diagnosis. After changing code or configuration, select a new results root. Inside a child process, `cuda:0` refers to its assigned physical GPU 1, 2 or 3.
 
 ## Run checks
 

@@ -5,6 +5,7 @@ import torch
 
 from .adaptive_strategy import advance_time_frontier, blend_control, control_snapshot, trial_transition
 from .trial_control import expiry_decision, physical_observation
+from .rollback_whitelist import is_rollback_whitelisted
 
 
 class AdaptiveOnlineMixin:
@@ -20,6 +21,8 @@ class AdaptiveOnlineMixin:
                     (controller.active_trial or controller.pending_persistent_feedback))
 
     def _initialize_adaptive_trial(self, applied):
+        if is_rollback_whitelisted(applied):
+            return
         if not self._adaptive_config().get("progressive_enabled"):
             return
         trial = self.online_morph_controller.active_trial
@@ -41,6 +44,8 @@ class AdaptiveOnlineMixin:
             "intervention_id": trial["intervention_id"], **applied["adaptive_trial"]})
 
     def _ramp_adaptive_trial(self, trial, immediate=False):
+        if is_rollback_whitelisted(trial):
+            return
         state = trial.get("adaptive_trial")
         if not state:
             return
@@ -57,6 +62,8 @@ class AdaptiveOnlineMixin:
         loss.load_state_dict(current)
 
     def _update_adaptive_trial(self, trial, feedback, horizon):
+        if is_rollback_whitelisted(trial):
+            return None
         state = trial.get("adaptive_trial")
         if not state:
             return None
@@ -75,6 +82,8 @@ class AdaptiveOnlineMixin:
         return event
 
     def _adaptive_expiry_decision(self, trial, feedback):
+        if is_rollback_whitelisted(trial):
+            return "confirm"
         config = self._adaptive_config().get("trial_control", {})
         if not config.get("enabled"):
             return "confirm" if feedback.get("credit_eligible") and feedback.get("accepted") else "rollback"
@@ -91,6 +100,15 @@ class AdaptiveOnlineMixin:
     def _finish_adaptive_trial(self, trial, feedback, persistent_event):
         if persistent_event.get("duplicate_ignored"):
             return
+        if is_rollback_whitelisted(trial):
+            trial.pop("adaptive_trial", None)
+            persistent_event["rollback_allowed"] = False
+            persistent_event["adaptive_trial"] = {
+                "status": "retained_by_whitelist",
+                "step": self._actual_iterations,
+                "intervention_id": trial.get("intervention_id"),
+            }
+            return True
         if persistent_event.get("confounded_by_intervention_ids"):
             raise RuntimeError("Progressive trials require isolated persistent feedback")
         state = trial["adaptive_trial"]
@@ -158,6 +176,8 @@ class AdaptiveOnlineMixin:
         points = points[:int(config.get("points", 32))]
         loss = self.built.loss_function
         for trial in trials:
+            if is_rollback_whitelisted(trial):
+                continue
             state = trial.get("adaptive_trial")
             if not state or state.get("influence", 0) == 0 or not self.morphable_model.trial_is_reversible(trial["intervention_id"]):
                 continue

@@ -22,6 +22,8 @@ from morph.pipeline.d_algorithm_generation.llm.json_extractor import (
 )
 
 from .adaptation_program import (
+    ADAPT_SAMPLING_DISTRIBUTION,
+    SAMPLING_ADAPTATION,
     ADD_FOURIER_BRANCH,
     ADD_LAYER,
     ADD_LOCALIZED_EXPERT,
@@ -68,6 +70,9 @@ import time
 import torch
 
 from .intervention_tracker import FEEDBACK_HORIZONS, InterventionTracker
+from .rollback_whitelist import (
+    executed_primitive_names, is_rollback_whitelisted, rollback_whitelist_groups,
+)
 from .online_diagnostics import (
     OnlineMorphDiagnostics,
     build_budget_diagnostics,
@@ -86,12 +91,13 @@ from .online_morph import (
     SafeExecutionEngine,
 )
 from .validation_probe import fit_log_linear_continuation
+from .sampling_runtime import sampling_policy_fractions
 
 
 POLICY_POPULATION_SIZE = 5
 KEEP_CONTINUATION_BASELINE_POLICY_ID = "__keep_continuation_baseline__"
 DEFAULT_KEEP_BASELINE_MARGIN = 0.05
-PROMPT_HISTORY_MAX_CHARS = 12_000
+PROMPT_HISTORY_MAX_CHARS = 6_000
 EVOLUTION_MODES = (
     "refine",
     "physics_guided",
@@ -164,88 +170,84 @@ _CAPABILITY_SCIENTIFIC_GUIDE = {
     "PROJECT_CONFLICTING_GRADIENTS": "activate deterministic PCGrad-style projection for conflicting registered physics components",
     "EMPHASIZE_CONSTRAINTS": "protect boundary and initial constraints when PDE gradients starve them",
     "MITIGATE_GRADIENT_CONFLICT": "apply bounded constraint-protective weighting when PDE and constraint gradients conflict",
-    "ADAPT_SAMPLING_DISTRIBUTION": "replace a fixed-budget subset with high-residual and exploratory collocation points",
+    "ADAPT_SAMPLING_DISTRIBUTION": "replace the complete PDE cloud using your chosen local high-residual/global allocation and optional point_count; point_count may exceed configured sampling limits; set local_fraction in [0,1] and global=1-local; ordinary sampling requires a changed current_sampling_policy; no utility validation or rollback, not evidence of benefit",
     "ENTER_LBFGS_PHASE": "enter the registered second-order polishing phase when Adam shows a genuine physics plateau with stable gradients; do not use before there is plateau evidence",
 }
 
-# The generation prompt must state the full schema vocabulary that
-# AdaptationProgram/PolicyCandidate validation enforces; it is derived from
-# the same constants so prompt and validator cannot drift apart.
+_SAMPLING_ALLOCATION_GUIDANCE = (
+    "Sampling guidance: prioritize full-domain coverage; prefer a global majority "
+    "when localization evidence is absent. Increase local allocation only for "
+    "measured residual concentration or a supported localized PDE feature "
+    "(shock, layer, interface). IC dominance or gradient conflict alone is not "
+    "localization evidence. PDE-cloud changes leave IC/BC sample pools unchanged; "
+    "boundary_regions adds a boundary preference to PDE residual ranking, not BC points. "
+    "Early residuals may be uninformative before IC is learned. Choose the ratio "
+    "freely and cite spatial evidence; no fixed allocation is imposed.\n"
+)
+
+
+def _prompt_json(value: Any) -> str:
+    """Compact wire format; retain exact numbers, false flags and empty programs."""
+    return json.dumps(value, ensure_ascii=False, separators=(",", ":"), default=str)
+
+
+def _prompt_capabilities(primitives: Sequence[str] | None = None) -> dict[str, Any]:
+    """Describe each primitive once, using the executor's own contracts."""
+    selected = set(CAPABILITY_REGISTRY if primitives is None else primitives)
+    return {
+        name: {
+            "actions": list(contract["action_families"]),
+            "targets": list(contract["targets"]),
+            "parameters": contract["parameters"],
+            "physics": _CAPABILITY_SCIENTIFIC_GUIDE[name],
+        }
+        for name, contract in CAPABILITY_REGISTRY.items()
+        if name in selected
+    }
+
+
+# Keep the complete validator vocabulary while eliminating repeated tables.
 _GENERATION_SCHEMA_CONTRACT = (
-    "The returned object must contain policy_spec. policy_spec must contain "
-    "exactly conditions and program. The returned object may additionally "
-    "contain capability_gap_proposals for audit only; this field is never "
-    "executed or scored.\n"
-    f"conditions: object with at most {MAXIMUM_CONDITION_COUNT} entries; each "
-    "key must be one of "
-    f"[{', '.join(CONDITION_STATE_PATHS)}], mapped to an exact scalar value "
-    'or to a numeric range {"min": x} / {"max": x} / {"min": x, "max": x}. '
-    "Range keys other than min/max (for example lt, gt, eq) are rejected, as "
-    "are keys outside the list. budget.cooldown_active is a system hard "
-    "constraint and may never appear in conditions. Candidates compete at "
-    "the current diagnostic moment: when action is not KEEP, every "
-    "condition must already be TRUE in the Current state JSON below; only an "
-    "explicit KEEP candidate may carry conditions that do "
-    "not hold now.\n"
-    "program keys and constraints:\n"
-    f"- diagnosis: non-empty string, at most {MAXIMUM_DIAGNOSIS_CHARS} characters.\n"
-    "- trigger: object whose keys may only be: "
-    f"{', '.join(PROGRAM_TRIGGER_FIELDS)}.\n"
-    "- action: exactly one of "
-    f"[{', '.join(ONLINE_ADAPTATION_ACTIONS)}].\n"
-    "- mechanism: exactly one registered deterministic capability compatible "
-    "with action. Compatibility map: "
-    f"{json.dumps({key: sorted(value) for key, value in MECHANISMS_BY_ACTION.items()}, sort_keys=True)}. "
-    "AUTO delegates the choice to the executor; NONE is valid only for KEEP.\n"
-    "- Choose action, program target, and each operation together from this "
-    "joint compatibility contract. program target.region must belong to "
-    "program_targets; each operation target.region must belong to that "
-    "primitive's targets (explicitly override it when the program target is "
-    "not compatible). AUTO does not override target or primitive checks: "
-    f"{json.dumps({action: {'program_targets': sorted(ACTION_TARGETS[action]), 'operations': {primitive: {'targets': CAPABILITY_REGISTRY[primitive]['targets']} for primitive in sorted(mechanisms) if primitive in CAPABILITY_REGISTRY}} for action, mechanisms in MECHANISMS_BY_ACTION.items()}, sort_keys=True)}.\n"
-    "Registered per-operation parameter contracts (all fields optional; "
-    "strength supplies the default magnitude): "
-    f"{json.dumps({key: value['parameters'] for key, value in CAPABILITY_REGISTRY.items()}, sort_keys=True)}.\n"
-    "- scientific mechanism guide: "
-    f"{json.dumps(_CAPABILITY_SCIENTIFIC_GUIDE, sort_keys=True)}. Select a "
-    "mechanism only when the current reference-free diagnostic evidence "
-    "supports its stated inductive bias.\n"
-    "- target: object with region one of "
-    f"[{', '.join(TARGET_REGIONS)}] and selector one of "
-    f"[{', '.join(TARGET_SELECTORS)}]; required whenever action is not KEEP.\n"
-    "- strength: number in (0, 1] for an online adaptation and 0 for KEEP.\n"
-    "- operations: the authoritative ordered deterministic request. KEEP must "
-    "use []; every non-KEEP proposal should provide one or more operation objects. "
-    'Each operation is {"primitive": <registered capability>, "strength": '
-    '<number in (0,1]>, "target": {"region": ..., "selector": ...} (optional; '
-    'inherits program target), "parameters": {...} (optional)}. Operations '
-    "execute in list order, may repeat a primitive, and are one atomic "
-    "transaction. Every primitive must be compatible with action; use "
-    "EXPLORATORY_MORPH only for the structural primitives explicitly listed "
-    "under that action. It cannot mix objective, sampling or optimizer "
-    "primitives. Parameter contracts "
-    "come only from the registered capability table above. Do not invent "
-    "parameter keys or executable code.\n"
-    "- mechanism must equal the primitive of a single-operation request "
-    "(or AUTO); use AUTO for a "
-    "multi-operation sequence. The operation list, when present, is more "
-    "specific and is what the executor compiles.\n"
-    "- recovery_steps: integer in [0, 2000]; must be 0 when action is KEEP.\n"
-    "- cooldown_steps: integer in [0, 5000].\n"
-    '- fallback: {} or exactly {"condition": <dotted state path>, '
-    '"action": <one high-level action>}.\n'
-    f"- reason: short string, at most {MAXIMUM_REASON_CHARS} characters.\n"
-    "KEEP is a first-class decision. Return KEEP when the current causal "
-    "evidence does not justify an intervention; never manufacture "
-    "an intervention merely to make the generation non-KEEP.\n"
-    "If the registered menu cannot express a scientifically important "
-    "response, still return a valid registered fallback in policy_spec and "
-    "optionally add capability_gap_proposals (at most 3), each shaped as "
+    'Return {"policy_spec":{"conditions":{},"program":{...}}}; '
+    "policy_spec has exactly those two keys.\n"
+    f"conditions: at most {MAXIMUM_CONDITION_COUNT} keys from "
+    f"{_prompt_json(CONDITION_STATE_PATHS)}, each an exact scalar or a range "
+    '{"min":x,"max":x} (either bound optional; no lt/gt/eq). '
+    "Non-KEEP conditions must already hold in Current state; only KEEP may "
+    "have unmatched conditions. Never condition on budget.cooldown_active.\n"
+    "program fields:\n"
+    f"diagnosis: nonempty string <= {MAXIMUM_DIAGNOSIS_CHARS} chars; "
+    f"reason: string <= {MAXIMUM_REASON_CHARS} chars. Use brief evidence-based phrases.\n"
+    f"trigger: object using only {_prompt_json(PROGRAM_TRIGGER_FIELDS)}.\n"
+    f"action: one of {_prompt_json(ONLINE_ADAPTATION_ACTIONS)}.\n"
+    "mechanism: registered primitive compatible with action, or AUTO; "
+    "NONE only for KEEP. For one operation use its primitive or AUTO; "
+    "for multiple operations use AUTO.\n"
+    "target: {region,selector}, required for non-KEEP. Program region must "
+    "belong to its action's program_targets below; each operation region must "
+    "belong to its primitive's targets. AUTO never relaxes compatibility. "
+    f"Selectors: {_prompt_json(TARGET_SELECTORS)}.\n"
+    "strength: (0,1] for intervention, 0 for KEEP.\n"
+    "operations: [] for KEEP, otherwise an ordered atomic list of "
+    '{"primitive":name,"strength":value,"target":{region,selector},'
+    '"parameters":{...}}. target may inherit program target; parameters are '
+    "optional and strength provides default magnitude. Repeated primitives "
+    "are allowed. Every primitive must support action; EXPLORATORY_MORPH "
+    "supports only its registered structural primitives. Do not invent keys "
+    "or executable code. Select each mechanism from its physics evidence.\n"
+    "recovery_steps: integer [0,2000], 0 for KEEP; cooldown_steps: integer [0,5000].\n"
+    'fallback: {} or exactly {"condition":dotted_state_path,"action":high_level_action}.\n'
+    "Program targets by action: "
+    f"{_prompt_json({action: sorted(targets) for action, targets in ACTION_TARGETS.items()})}\n"
+    "Registered capabilities (actions, operation targets, parameters, physics): "
+    f"{_prompt_json(_prompt_capabilities())}\n"
+    "KEEP is valid when evidence does not justify intervention. Optional "
+    "capability_gap_proposals are audit-only, never executed/scored: at most 3 "
+    "objects shaped as "
     '{"name": <short proposed capability>, "category": <architecture|objective|sampling|constraint|optimizer|representation>, '
     '"target": <where it should act>, "rationale": <why registered capabilities are insufficient>, '
     '"trigger_evidence": [<current reference-free signals>], "required_executor_behavior": <deterministic behavior needed>}. '
-    "Do not put executable code in a gap proposal. Return exactly one JSON "
-    "object. No code, no markdown fences."
+    "Still supply a valid registered policy. JSON only, no code or markdown."
 )
 
 _GENERATION_EXAMPLE = {
@@ -536,6 +538,13 @@ def compact_morph_event(event: Mapping[str, Any]) -> dict[str, Any]:
         "parameter_count_before",
         "parameter_count_after",
         "parameter_growth_ratio",
+        "credit_eligible",
+        "feedback_exempt",
+        "rollback_allowed",
+        "accepted",
+        "architecture_action",
+        "aggregate_continuation_utility",
+        "forced_initial_sampling",
     ):
         value = source.get(key)
         if value is not None and isinstance(value, (str, int, float, bool)):
@@ -543,7 +552,7 @@ def compact_morph_event(event: Mapping[str, Any]) -> dict[str, Any]:
     reason = source.get("reason")
     if reason is not None:
         summary["reason"] = str(reason)[:240]
-    program = source.get("adaptation_program") or source.get("program") or {}
+    program = source.get("adaptation_program") or source.get("program")
     if isinstance(program, Mapping):
         if program.get("action") is not None:
             summary["architecture_action"] = str(program.get("action"))
@@ -553,6 +562,11 @@ def compact_morph_event(event: Mapping[str, Any]) -> dict[str, Any]:
             for item in operations
             if isinstance(item, Mapping) and item.get("primitive")
         ]
+    elif isinstance(source.get("primitives"), (list, tuple)):
+        summary["primitives"] = list(source["primitives"][:8])
+    if source.get("feedback_status") == "whitelisted":
+        summary.update(credit_eligible=False, feedback_exempt=True,
+                       outcome="applied_without_utility_validation")
     physics = source.get("physics_utility") or {}
     if isinstance(physics, Mapping):
         if physics.get("accepted") is not None:
@@ -560,7 +574,9 @@ def compact_morph_event(event: Mapping[str, Any]) -> dict[str, Any]:
         aggregate = physics.get("aggregate_continuation_utility")
         if isinstance(aggregate, (int, float)):
             summary["aggregate_continuation_utility"] = float(aggregate)
-    instruction_audit = source.get("architecture_instruction_audit") or {}
+    instruction_audit = (source.get("architecture_instruction_audit")
+                         or source.get("sampling_instruction_audit")
+                         or source.get("objective_instruction_audit"))
     if isinstance(instruction_audit, Mapping):
         summary["instruction_execution"] = {
             "transaction_status": instruction_audit.get("transaction_status"),
@@ -584,6 +600,8 @@ def compact_morph_event(event: Mapping[str, Any]) -> dict[str, Any]:
                 list(instruction_audit.get("substitutions") or ())[:8]
             ),
         }
+    elif isinstance(source.get("instruction_execution"), Mapping):
+        summary["instruction_execution"] = deepcopy(source["instruction_execution"])
     return summary
 
 
@@ -595,7 +613,8 @@ def compact_policy_state(state: Mapping[str, Any]) -> dict[str, Any]:
         "step": source.get("step", source.get("global_step", 0))
     }
     for name in (
-        "optimization", "gradient", "spatial", "frequency", "budget", "physics"
+        "optimization", "gradient", "spatial", "frequency", "budget", "physics",
+        "current_sampling_policy",
     ):
         value = source.get(name)
         if isinstance(value, Mapping):
@@ -632,7 +651,7 @@ def compact_policy_state(state: Mapping[str, Any]) -> dict[str, Any]:
     }
     result["previous_morph_events"] = [
         compact_morph_event(item)
-        for item in list(source.get("previous_morph_events") or ())[-6:]
+        for item in list(source.get("previous_morph_events") or ())[-3:]
         if isinstance(item, Mapping)
     ]
     for forecast_key in ("continuation_forecast", "audit_continuation_forecast"):
@@ -802,6 +821,36 @@ def adaptation_program_fingerprint(
     return hashlib.sha256(encoded.encode("utf-8")).hexdigest()[:20]
 
 
+def effective_sampling_policy(
+    program: AdaptationProgram, default_policy: Mapping[str, Any] | None = None
+) -> dict[str, Any] | None:
+    """Identify the policy the sampler executes, excluding cosmetic fields.
+
+    Sampling ranks PDE residuals and replaces the entire cloud. Allocation,
+    candidate multiplier and region are effective parameters; strength and
+    selector do not affect ranking. An operation may override the region.
+    """
+    if program.action not in SAMPLING_ACTIONS or len(program.operations) > 1:
+        return None
+    operation = program.operations[0] if program.operations else None
+    if operation is not None and operation.primitive != ADAPT_SAMPLING_DISTRIBUTION:
+        return None
+    parameters = dict(operation.parameters) if operation is not None else {}
+    defaults = dict(default_policy or {})
+    local_fraction, global_fraction = sampling_policy_fractions(
+        parameters, default_local_fraction=float(defaults.get("local_fraction", 0.7))
+    )
+    target = dict(operation.target) if operation is not None else {}
+    return {
+        "primitive": ADAPT_SAMPLING_DISTRIBUTION,
+        "region": str(target.get("region") or program.target.get("region")),
+        "candidate_multiplier": max(1, int(parameters.get("candidate_multiplier", defaults.get("candidate_multiplier", 4)))),
+        "local_fraction": local_fraction,
+        "global_fraction": global_fraction,
+        **({"point_count": int(parameters["point_count"])} if "point_count" in parameters else {}),
+    }
+
+
 def adaptation_hypothesis_signature(
     value: AdaptationProgram | Mapping[str, Any],
 ) -> str:
@@ -892,19 +941,42 @@ def compact_shared_evidence(evidence: Mapping[str, Any]) -> dict[str, Any]:
 def compact_shared_history(
     history: Sequence[Mapping[str, Any]],
     *,
-    maximum_items: int = 6,
+    maximum_items: int = 3,
     maximum_chars: int = PROMPT_HISTORY_MAX_CHARS,
 ) -> list[dict[str, Any]]:
     """Keep the newest complete compact records under a hard prompt budget."""
 
+    if int(maximum_items) <= 0:
+        return []
+    char_limit = max(256, int(maximum_chars))
     selected: list[dict[str, Any]] = []
     used = 2  # JSON list brackets
     for item in reversed(list(history)[-max(0, int(maximum_items)) :]):
         compact = compact_shared_evidence(item)
-        size = len(json.dumps(compact, ensure_ascii=False, default=str)) + 1
-        if selected and used + size > max(256, int(maximum_chars)):
+        # Earlier decisions/outcomes are already separate records. Repeating
+        # their history and forecasts inside each state_before bloats every call.
+        historical_state = compact["state_before"]
+        for key in ("previous_morph_events", "continuation_forecast", "audit_continuation_forecast"):
+            historical_state.pop(key, None)
+        historical_state["optimization"] = {
+            key: value for key, value in historical_state.get("optimization", {}).items()
+            if key in ("current_total_loss", "relative_loss_improvement", "plateau", "insufficient_progress")
+        }
+        historical_state["gradient"] = {
+            key: value for key, value in historical_state.get("gradient", {}).items()
+            if key in ("available", "gradient_status", "persistent_gradient_conflict",
+                       "gradient_conflict_detected", "gradient_imbalance_detected",
+                       "max_min_gradient_norm_ratio", "minimum_gradient_cosine")
+        }
+        compact["program"] = _prompt_program(compact["program"])
+        compact["feedback"] = {
+            horizon: _prompt_feedback(payload)
+            for horizon, payload in compact["feedback"].items()
+        }
+        size = len(_prompt_json(compact)) + 1
+        if selected and used + size > char_limit:
             break
-        if not selected and size > max(256, int(maximum_chars)):
+        if not selected and used + size > char_limit:
             # This should be rare after compaction; retain causal identity and
             # outcome instead of slicing JSON into an invalid document.
             compact = {
@@ -913,24 +985,89 @@ def compact_shared_history(
                 "state_id": compact.get("state_id"),
                 "start_step": compact.get("start_step"),
                 "program": compact.get("program"),
-                "feedback": {
-                    horizon: {
-                        key: payload.get(key)
-                        for key in (
-                            "credit", "accepted", "reason",
-                            "aggregate_continuation_utility",
-                            "max_component_degradation", "confounded",
-                        )
-                        if payload.get(key) is not None
-                    }
-                    for horizon, payload in dict(compact.get("feedback") or {}).items()
-                },
+                "feedback": compact["feedback"],
             }
-            size = len(json.dumps(compact, ensure_ascii=False, default=str)) + 1
+            size = len(_prompt_json(compact)) + 1
+            if used + size > char_limit:
+                # An unusually large operation parameter list is already in
+                # the local audit. Keep the ordered primitives and uncertainty
+                # flags on the wire instead of silently exceeding the budget.
+                program = compact["program"] or {}
+                compact["program"] = {
+                    **{key: program[key] for key in ("action", "mechanism", "target", "strength") if key in program},
+                    "primitives": [operation.get("primitive") for operation in program.get("operations", [])],
+                }
+                compact["feedback"] = {
+                    horizon: {key: value for key, value in payload.items()
+                              if isinstance(value, (str, int, float, bool))}
+                    for horizon, payload in compact["feedback"].items()
+                }
+                size = len(_prompt_json(compact)) + 1
+            if used + size > char_limit:
+                break
         selected.append(compact)
         used += size
     selected.reverse()
     return selected
+
+
+def _prompt_program(program: Mapping[str, Any], *, prose: bool = True) -> dict[str, Any]:
+    result = deepcopy(dict(program))
+    for key, limit in (("diagnosis", 96), ("reason", 160)):
+        if key in result:
+            if prose:
+                result[key] = str(result[key])[:limit]
+            else:
+                result.pop(key)
+    return result
+
+
+def _prompt_feedback(feedback: Mapping[str, Any]) -> dict[str, Any]:
+    """Preserve causal eligibility, probe disagreement and worst-region evidence."""
+    result = _compact_feedback(feedback)
+    for key, value in list(result.items()):
+        if isinstance(value, str):
+            result[key] = value[:160]
+        elif isinstance(value, Mapping) and key.startswith("region_"):
+            # Keep the hardest regions, plus all explicitly identified worst ones.
+            worst = {str(result[name]) for name in (
+                "decision_worst_region_id", "audit_worst_region_id", "worst_region_id"
+            ) if result.get(name) is not None}
+            ordered = sorted(value, key=lambda name: (
+                str(name) not in worst,
+                -float(value[name]) if key == "region_degradations" else float(value[name])
+            )) if all(isinstance(v, (int, float)) for v in value.values()) else list(value)
+            names = sorted(worst.intersection(value)) + [name for name in ordered if name not in worst][:4]
+            result[key] = {name: value[name] for name in names}
+    return result
+
+
+def _prompt_policy(candidate: PolicyCandidate, *, full: bool) -> dict[str, Any]:
+    credit = compact_policy_credit(candidate)
+    credit["recent_results"] = [
+        {**item, "feedback": _prompt_feedback(item["feedback"])}
+        for item in credit["recent_results"][-2:]
+    ]
+    if full:
+        # The assigned parent retains its complete schema for a real mutation.
+        credit["policy_spec"] = deepcopy(candidate.policy_spec)
+    else:
+        program = _prompt_program(candidate.policy_spec["program"], prose=False)
+        credit["conditions"] = deepcopy(candidate.policy_spec.get("conditions", {}))
+        credit["program"] = {
+            key: program[key] for key in ("action", "mechanism", "target", "strength", "operations")
+            if key in program
+        }
+    return credit
+
+
+def _prompt_proposals(proposals: Sequence[ProgramProposal]) -> list[dict[str, Any]]:
+    # All proposals share the current state; scores and duplicate prose are outputs.
+    return [
+        {"policy_id": item.policy_id, "policy_version": item.policy_version,
+         "program": _prompt_program(item.program.to_dict())}
+        for item in proposals
+    ]
 
 
 def compact_policy_candidate(candidate: PolicyCandidate) -> dict[str, Any]:
@@ -1209,7 +1346,9 @@ class PolicyPopulation:
         gated: list[ProgramProposal] = []
         audits: list[dict[str, Any]] = []
         for proposal in proposals:
-            if not proposal.program.has_intervention():
+            if not proposal.program.has_intervention() or proposal.program.action in SAMPLING_ACTIONS:
+                # Sampling has no causal feedback. Its repeats are governed by
+                # the controller's current policy, rather than all-time history.
                 gated.append(proposal)
                 continue
             fingerprint = adaptation_program_fingerprint(proposal.program)
@@ -1300,6 +1439,7 @@ class PolicyPopulation:
         trajectory without online adaptation.
         """
 
+        self.last_selection_provider_calls = 0
         if scoring_provider is None or not callable(
             getattr(scoring_provider, "complete_text", None)
         ):
@@ -1307,6 +1447,8 @@ class PolicyPopulation:
         if proposals is None:
             proposals = self.propose_all(state)
         augmented_proposals = self._with_keep_continuation_baseline(state, proposals)
+        if isinstance(scoring_provider, BudgetedProvider):
+            scoring_provider.ensure_available()
         self.last_selection_provider_calls = 1
         response = scoring_provider.complete_text(
             [
@@ -1316,7 +1458,7 @@ class PolicyPopulation:
                 }
             ],
             temperature=float(temperature),
-            max_tokens=1800,
+            max_tokens=1200,
             task="online_candidate_scoring",
         )
         if not bool(getattr(response, "success", True)):
@@ -1343,6 +1485,8 @@ class PolicyPopulation:
         ]
         tie_break_audit: dict[str, Any] | None = None
         if len(tied) > 1:
+            if isinstance(scoring_provider, BudgetedProvider):
+                scoring_provider.ensure_available()
             self.last_selection_provider_calls += 1
             tie_response = scoring_provider.complete_text(
                 [
@@ -1354,7 +1498,7 @@ class PolicyPopulation:
                     }
                 ],
                 temperature=float(temperature),
-                max_tokens=1400,
+                max_tokens=1200,
                 task="online_candidate_scoring_tiebreak",
             )
             if not bool(getattr(tie_response, "success", True)):
@@ -1545,53 +1689,46 @@ class PolicyPopulation:
             compact_state["online_adaptation"] = deepcopy(state["online_adaptation"])
         history = compact_shared_history(self.shared_history)
         policy_evidence = {
-            item.policy_id: compact_policy_credit(item) for item in self.policies
+            item.policy_id: {
+                key: value for key, value in _prompt_policy(item, full=False).items()
+                if key not in ("conditions", "program")
+            } for item in self.policies
         }
+        primitives = [
+            operation.primitive for proposal in proposals
+            for operation in proposal.program.operations
+        ]
+        primitives.extend(
+            item.program.mechanism for item in proposals
+            if not item.program.operations and item.program.mechanism in CAPABILITY_REGISTRY
+        )
         return (
-            "You are the independent scorer for online PINN adaptation "
-            "proposals produced by another model plus one explicit KEEP "
-            "continuation baseline. The KEEP baseline is not an evolvable "
-            "policy: it represents continuing the current optimizer trajectory "
-            "without online adaptation under continuation_forecast and "
-            "audit_continuation_forecast in Current state. Evaluate predicted physical "
-            "benefit and execution risk using only PDE/BC/IC residual evidence, "
-            "optimization state, architecture, budget, and causal action-outcome "
-            "history. Feedback with credit_eligible=false or feedback_status="
-            "credit_withheld is neutral uncertainty, never evidence that the "
-            "action failed. Read withheld_kind precisely: "
-            "same_direction_low_confidence means both probes support the same "
-            "qualitative trend but numeric credit is unsafe; "
-            "opposite_probe_directions means the action did not generalize "
-            "consistently across probes; opposite_worst_region_directions means "
-            "global averages agree but a worst physical region does not. Use the "
-            "bounded qualitative_credit_hint only as weak directional evidence, "
-            "never as formal causal credit. Burgers region_continuation_utility "
-            "and worst-region fields are held-out shock-window PDE-residual "
-            "evidence, not solution error. Never use reference-solution error "
-            "or MSE. Score every "
-            "proposal exactly once, including the explicit KEEP baseline. Prefer "
-            "KEEP when the current residual trajectory is still improving, when "
-            "forecast evidence is weak, or when an intervention's recovery risk "
-            "is not clearly outweighed by state-specific physical benefit. Do "
-            "not score an intervention above KEEP merely because it is more "
-            "active, novel, or larger. Treat each operations list as an ordered "
-            "atomic request: assess the physical rationale and interaction of "
-            "the complete sequence, its targets, and its explicit parameters, "
-            "not merely the high-level action label. Return only JSON with this schema: "
+            "Independently score online PINN proposals against explicit KEEP "
+            "(continuing current optimization under both continuation forecasts). "
+            "Use only PDE/BC/IC residuals, optimization, topology, remaining "
+            "budget and causal history; never MSE, L2 or reference solutions. "
+            "credit_eligible=false/credit_withheld means uncertainty, not failure. "
+            "whitelisted means applied without utility validation, never proven "
+            "success. Retain current_sampling_policy; an identical effective "
+            "sampling policy is KEEP, not a reason to refresh points. "
+            "same_direction_low_confidence permits only the bounded weak "
+            "qualitative_credit_hint; opposite_probe_directions or "
+            "opposite_worst_region_directions indicates poor generalization. "
+            "Burgers region/worst-region utilities are held-out shock-window "
+            "PDE evidence. Prefer KEEP under ongoing improvement, weak forecasts "
+            "or unclear benefit after recovery risk. Do not reward novelty, "
+            "size or activity alone. Assess each complete ordered atomic "
+            "operations list, targets and parameters. Score every proposal once; "
+            f"{_SAMPLING_ALLOCATION_GUIDANCE}"
+            "do not modify programs. Return only JSON: "
             '{"scores":[{"policy_id":"exact id","score":0.0,'
-            '"reason":"brief evidence-based reason"}]}. Scores must be finite '
-            "numbers in [0,1]. Do not invent or modify candidate programs; your "
-            "only job is scoring.\n"
-            "Executor capability contract: "
-            f"{json.dumps(CAPABILITY_REGISTRY, ensure_ascii=False, default=str)}\n"
-            "Static prior knowledge below is non-binding and contains no "
-            "reference-solution score. Use it only to assess physical fit and "
-            "risk; actual state/action/outcome evidence overrides it.\n"
-            f"Current state: {json.dumps(compact_state, ensure_ascii=False, default=str)}\n"
-            f"Proposals: {json.dumps([item.to_dict() for item in proposals], ensure_ascii=False, default=str)}\n"
-            f"Per-policy causal evidence: {json.dumps(policy_evidence, ensure_ascii=False, default=str)}\n"
-            f"Static prior knowledge: {json.dumps(self.prior_context, ensure_ascii=False, default=str)}\n"
-            f"Shared execution history: {json.dumps(history, ensure_ascii=False, default=str)}"
+            '"reason":"one short evidence-based sentence"}]}; finite scores in [0,1].\n'
+            f"Relevant executor capabilities: {_prompt_json(_prompt_capabilities(primitives))}\n"
+            f"Current state: {_prompt_json(compact_state)}\n"
+            f"Proposals: {_prompt_json(_prompt_proposals(proposals))}\n"
+            f"Per-policy causal evidence: {_prompt_json(policy_evidence)}\n"
+            f"Static prior knowledge (non-binding): {_prompt_json(self.prior_context)}\n"
+            f"Shared execution history: {_prompt_json(history)}"
         )
 
     def _tie_break_scoring_prompt(
@@ -1607,7 +1744,10 @@ class PolicyPopulation:
             compact_state["online_adaptation"] = deepcopy(state["online_adaptation"])
         history = compact_shared_history(self.shared_history)
         evidence = {
-            item.policy_id: compact_policy_credit(item)
+            item.policy_id: {
+                key: value for key, value in _prompt_policy(item, full=False).items()
+                if key not in ("conditions", "program")
+            }
             for item in self.policies
             if item.policy_id in {proposal.policy_id for proposal in tied}
         }
@@ -1649,13 +1789,15 @@ class PolicyPopulation:
             "Score every tied candidate exactly once. Prefer distinct numeric "
             "scores; if they remain numerically equal, winner_policy_id is "
             "mandatory and must identify one of the highest-scoring candidates.\n"
-            "Executor capability contract: "
-            f"{json.dumps(CAPABILITY_REGISTRY, ensure_ascii=False, default=str)}\n"
-            f"Current state: {json.dumps(compact_state, ensure_ascii=False, default=str)}\n"
-            f"First-round tied scores: {json.dumps(initial, ensure_ascii=False, default=str)}\n"
-            f"Tied proposals: {json.dumps([item.to_dict() for item in tied], ensure_ascii=False, default=str)}\n"
-            f"Tied-policy causal evidence: {json.dumps(evidence, ensure_ascii=False, default=str)}\n"
-            f"Shared execution history: {json.dumps(history, ensure_ascii=False, default=str)}"
+            "Withheld causal credit is uncertainty, not failure. Whitelisted "
+            "means applied without utility validation, never proven success. "
+            "An identical current_sampling_policy must remain KEEP.\n"
+            f"{_SAMPLING_ALLOCATION_GUIDANCE}"
+            f"Current state: {_prompt_json(compact_state)}\n"
+            f"First-round tied scores: {_prompt_json(initial)}\n"
+            f"Tied proposals: {_prompt_json(_prompt_proposals(tied))}\n"
+            f"Tied-policy causal evidence: {_prompt_json(evidence)}\n"
+            f"Shared execution history: {_prompt_json(history)}"
         )
 
     def get(self, policy_id: str) -> PolicyCandidate:
@@ -2007,7 +2149,7 @@ class PolicyPopulation:
                     response = provider.complete_text(
                         [{"role": "user", "content": prompt}],
                         temperature=float(temperature),
-                        max_tokens=2200,
+                        max_tokens=1800,
                         task=f"online_policy_{generation_kind}_{mode}",
                     )
                     if not bool(getattr(response, "success", True)):
@@ -2218,13 +2360,15 @@ class PolicyPopulation:
         )
         parent_payload = [
             {"policy_id": item.policy_id, "policy_spec": deepcopy(item.policy_spec)}
-            if random_direction else compact_policy_candidate(item)
+            if random_direction else _prompt_policy(item, full=True)
             for item in assigned_parents
         ]
         assigned_ids = {item.policy_id for item in assigned_parents}
         population = [
-            ({"policy_id": item.policy_id, "policy_spec": deepcopy(item.policy_spec)}
-             if random_direction else compact_policy_candidate(item))
+            ({"policy_id": item.policy_id,
+              "conditions": deepcopy(item.policy_spec.get("conditions", {})),
+              "program": _prompt_program(item.policy_spec["program"], prose=False)}
+             if random_direction else _prompt_policy(item, full=False))
             for item in self.policies
             if item.policy_id not in assigned_ids
         ]
@@ -2243,9 +2387,12 @@ class PolicyPopulation:
                 "conditions": deepcopy(
                     dict(item.policy_spec.get("conditions") or {})
                 ),
-                "program": deepcopy(
-                    dict(item.policy_spec.get("program") or {})
-                ),
+                "program": {
+                    key: value for key, value in _prompt_program(
+                        item.policy_spec["program"], prose=False
+                    ).items()
+                    if key in ("action", "mechanism", "target", "strength", "operations")
+                },
             }
             for item in generation_peers
         ]
@@ -2303,16 +2450,22 @@ class PolicyPopulation:
             "describe a missing mechanism only in capability_gap_proposals; "
             "never place it in the executable policy or emit executable code. "
             f"{feedback_instruction}"
+            "whitelisted means applied without utility validation, never proven "
+            "success. Inspect current_sampling_policy: identical effective "
+            "sampling policy must be KEEP. Changes to prose, strength, selector, "
+            "recovery/cooldown do not "
+            "change the effective policy.\n"
+            f"{_SAMPLING_ALLOCATION_GUIDANCE}"
             f"Schema contract:\n{_GENERATION_SCHEMA_CONTRACT}\n"
             "Valid example (structure only; adapt to the evidence):\n"
-            f"{json.dumps(_GENERATION_EXAMPLE, ensure_ascii=False)}\n"
-            f"Current state: {json.dumps(compact_state, ensure_ascii=False, default=str)}\n"
-            f"Static prior knowledge: {json.dumps(self.prior_context, ensure_ascii=False, default=str)}\n"
-            f"Shared execution history: {json.dumps(history, ensure_ascii=False, default=str)}\n"
-            f"Assigned parent policies: {json.dumps(parent_payload, ensure_ascii=False, default=str)}\n"
-            f"Other current policies: {json.dumps(population, ensure_ascii=False, default=str)}\n"
+            f"{_prompt_json(_GENERATION_EXAMPLE)}\n"
+            f"Current state: {_prompt_json(compact_state)}\n"
+            f"Static prior knowledge: {_prompt_json(self.prior_context)}\n"
+            f"Shared execution history: {_prompt_json(history)}\n"
+            f"Assigned parent policies: {_prompt_json(parent_payload)}\n"
+            f"Other current policies: {_prompt_json(population)}\n"
             "Candidates already accepted in this generation: "
-            f"{json.dumps(accepted_peer_payload, ensure_ascii=False, default=str)}"
+            f"{_prompt_json(accepted_peer_payload)}"
         )
 
     def _repair_all_keep_generation(
@@ -2356,10 +2509,13 @@ class PolicyPopulation:
                 + directive
             )
             try:
+                if isinstance(provider, BudgetedProvider):
+                    provider.ensure_available()
+                self.last_evolution_provider_calls += 1
                 response = provider.complete_text(
                     [{"role": "user", "content": prompt}],
                     temperature=float(temperature),
-                    max_tokens=2200,
+                    max_tokens=1800,
                     task=f"online_policy_{generation_kind}_{mode}_intervention_repair",
                 )
                 if not bool(getattr(response, "success", True)):
@@ -2410,6 +2566,8 @@ class PolicyPopulation:
                         "errors": [],
                     }
                 )
+                return
+            except LLMBudgetExceeded:
                 return
             except Exception:
                 # Best-effort round: try the next mode.
@@ -2473,7 +2631,8 @@ DEFAULT_ONLINE_MORPH_CONFIG: dict[str, Any] = {
     "decision_mode": "deterministic",
     "allowed_primitives": list(PRIMITIVE_LIBRARY),
     "adaptation_freeze_step": 14000,
-    "diagnostic_interval": 200,
+    "diagnostic_interval": 400,
+    "forced_initial_sampling_step": 200,
     "gradient_diagnostics": {"persistence_windows": 2},
     "policy_set": {
         "enabled": True,
@@ -2742,6 +2901,8 @@ class OnlineMorphController:
         self.registered_loss_intervention = False
         self.registered_optimization_intervention = False
         self.registered_sampling_intervention = False
+        self.current_sampling_policy: dict[str, Any] | None = None
+        self.forced_initial_sampling: dict[str, Any] = {}
         self.registered_curriculum_intervention = False
         policy_set_config = dict(self.config.get("policy_set") or {})
         self.policy_evolution_config = dict(
@@ -2758,6 +2919,190 @@ class OnlineMorphController:
     @property
     def enabled(self) -> bool:
         return bool(self.config.get("enabled", False))
+
+    def llm_budget_config(self) -> dict[str, Any]:
+        """Share optional limits across both roles; request counts are unlimited by default."""
+        efficiency = dict(
+            (self.config.get("adaptive_strategy") or {}).get("llm_efficiency") or {}
+        )
+        run_limit = int(self.policy_evolution_config.get("maximum_llm_calls_per_run", 0))
+        limits = [run_limit] if run_limit > 0 else []
+        if efficiency.get("enabled"):
+            efficiency_limit = int(efficiency.get("maximum_calls", 0))
+            if efficiency_limit > 0:
+                limits.append(efficiency_limit)
+        return {
+            "enabled": bool(limits or efficiency.get("enabled")),
+            "maximum_calls": min(limits) if limits else 0,
+            "maximum_wall_seconds": (
+                float(efficiency.get("maximum_wall_seconds", 900))
+                if efficiency.get("enabled") else 0
+            ),
+        }
+
+    def sampling_policy_is_current(self, program: AdaptationProgram) -> bool:
+        effective = effective_sampling_policy(program, (self.current_sampling_policy or {}).get("policy"))
+        return bool(effective is not None and self.current_sampling_policy
+                    and effective == self.current_sampling_policy.get("policy"))
+
+    def forced_initial_sampling_due(self, iteration: int) -> bool:
+        """One mandatory request at step 200, only for Full's feedback direction."""
+        step = int(self.config.get("forced_initial_sampling_step", 200))
+        return bool(
+            self.enabled and step > 0 and int(iteration) == step
+            and self.config.get("decision_mode") == "llm_evolution"
+            and self.policy_evolution_config.get("direction", "feedback") != "random"
+            and self.forced_initial_sampling.get("status") != "applied"
+        )
+
+    def propose_forced_initial_sampling(
+        self, diagnostic: OnlineMorphDiagnostics, provider: Any
+    ) -> OnlineMorphAction:
+        """Request a sampling plan, never a decision whether to intervene."""
+        if not self.forced_initial_sampling_due(diagnostic.step):
+            raise ValueError("Mandatory initial sampling is not due")
+        if provider is None:
+            raise RuntimeError("Mandatory sampling requires the generation LLM")
+        state = self.adaptation_state(diagnostic)
+        prompt = (
+            f"At optimizer step {diagnostic.step}, a PDE sampling adjustment is "
+            "MANDATORY and your plan will execute immediately. Do not decide "
+            "whether to intervene, score candidates or return KEEP. Choose the "
+            "local high-residual/full-domain allocation freely; there is no "
+            "fixed local/global ratio. You may also choose point_count, the total PDE "
+            "training points; it can exceed the configured sampling limit. If omitted, "
+            "the current total is retained. All points are replaced. No post-action "
+            "utility check or rollback. "
+            f"{_SAMPLING_ALLOCATION_GUIDANCE}"
+            "Return only JSON with region (one of "
+            f"{_prompt_json(CAPABILITY_REGISTRY[ADAPT_SAMPLING_DISTRIBUTION]['targets'])}), "
+            "local_fraction (number in [0,1]; global=1-local), "
+            "candidate_multiplier (integer >=1), optional point_count (positive integer total PDE points; may exceed configured limits), "
+            "reason (one short sentence). "
+            f"Current state: {_prompt_json(compact_policy_state(state))}"
+        )
+        wrapped = BudgetedProvider(provider, self.llm_budget_state, self.llm_budget_config())
+        before_calls = int(self.llm_budget_state["calls"])
+        self.forced_initial_sampling = {"status": "requested", "step": int(diagnostic.step)}
+        errors: list[str] = []
+        transient_failures = 0
+        attempt_limit = max(1, int(self.policy_evolution_config.get("maximum_attempts_per_mode", 5)))
+        try:
+            for attempt in range(attempt_limit):
+                response = wrapped.complete_text(
+                    [{"role": "user", "content": prompt + (
+                        "\nRepair the JSON format only: " + errors[-1] if errors else ""
+                    )}],
+                    temperature=float(self.policy_evolution_config.get("temperature", 0.7)),
+                    max_tokens=500, task="online_forced_initial_sampling",
+                )
+                if not bool(getattr(response, "success", True)):
+                    error = str(getattr(response, "error", "LLM request failed"))
+                    if not _is_transient_policy_provider_error(error) or attempt + 1 >= attempt_limit:
+                        raise RuntimeError(error)
+                    transient_failures += 1
+                    # A mandatory action has no population fallback. Retry a
+                    # temporary concurrency limit with bounded backoff instead.
+                    delay = min(
+                        max(0.0, float(self.policy_evolution_config.get("transient_retry_max_seconds", 4))),
+                        max(0.0, float(self.policy_evolution_config.get("transient_retry_initial_seconds", 1)))
+                        * 2 ** (transient_failures - 1),
+                    )
+                    if delay:
+                        time.sleep(delay)
+                    continue
+                try:
+                    raw, parse_errors = extract_json_object(str(getattr(response, "text", response)))
+                    if raw is None:
+                        raise ValueError("invalid JSON: " + "; ".join(parse_errors))
+                    # The response cannot veto this mandatory action. It only
+                    # specifies parameters of the registered sampling executor.
+                    if not {"region", "local_fraction", "candidate_multiplier"} <= set(raw):
+                        raise ValueError("region, local_fraction and candidate_multiplier are required")
+                    program = AdaptationProgram.from_dict({
+                        "diagnosis": "mandatory_step200_sampling_adjustment", "trigger": {},
+                        "action": SAMPLING_ADAPTATION, "mechanism": ADAPT_SAMPLING_DISTRIBUTION,
+                        "target": {"region": raw["region"], "selector": "highest_utility"},
+                        "strength": 1.0, "recovery_steps": 0, "cooldown_steps": 0,
+                        "reason": str(raw.get("reason") or "mandatory initial sampling plan"),
+                        "operations": [{"primitive": ADAPT_SAMPLING_DISTRIBUTION, "strength": 1.0,
+                                        "parameters": {"local_fraction": raw["local_fraction"],
+                                                       "candidate_multiplier": raw["candidate_multiplier"],
+                                                       **({"point_count": raw["point_count"]}
+                                                          if "point_count" in raw else {}),
+                                                       **({"global_fraction": raw["global_fraction"]}
+                                                          if "global_fraction" in raw else {})}}],
+                    })
+                except (TypeError, ValueError, KeyError) as exc:
+                    errors.append(str(exc)[:250])
+                    continue
+                sid = state_id(state)
+                self.forced_initial_sampling.update(status="planned", program=program.to_dict())
+                selection = {"policy_id": "forced-initial-sampling", "policy_version": 1,
+                             "state_id": sid, "selection_score": None}
+                return OnlineMorphAction(
+                    SAMPLING_ADAPTATION, 0, 0,
+                    {"decision_reason": "mandatory_initial_sampling", "forced_initial_sampling": True,
+                     "selected_policy_id": selection["policy_id"], "policy_selection": selection,
+                     "state_id": sid, "adaptation_program": program.to_dict(),
+                     "diagnostics": state, "llm_scoring": {"status": "skipped_mandatory_sampling"}},
+                    "mandatory_initial_sampling", InterventionClass.SAMPLING_INTERVENTION.value,
+                    {"target": str(raw["region"]), "selector": "highest_utility", "strength": "strong",
+                     "mechanism": ADAPT_SAMPLING_DISTRIBUTION}, (),
+                )
+            raise RuntimeError("Mandatory sampling plan could not be parsed: " + "; ".join(errors[-2:]))
+        except Exception as exc:
+            self.forced_initial_sampling.update(status="failed", error=f"{type(exc).__name__}: {exc}"[:500])
+            raise
+        finally:
+            calls = int(self.llm_budget_state["calls"]) - before_calls
+            self.forced_initial_sampling["provider_calls"] = calls
+            self.policy_evolution_calls += calls
+
+    @staticmethod
+    def _sampling_policy_from_event(event: Mapping[str, Any]) -> dict[str, Any] | None:
+        program = AdaptationProgram.from_dict(event.get("adaptation_program") or {})
+        executed_rule = dict((event.get("sampling_instruction_audit") or {}).get("effective_sampling_rule") or {})
+        effective = effective_sampling_policy(program, executed_rule)
+        if effective is None:
+            return None
+        # Execution metadata also migrates legacy events whose old executor
+        # overrode declared fractions with the historical 40/60 allocation.
+        for key in ("local_fraction", "global_fraction", "candidate_multiplier", "point_count"):
+            if key in executed_rule:
+                effective[key] = executed_rule[key]
+        after = dict(event.get("architecture_after") or {})
+        return {
+            "policy": effective,
+            "applied_step": int(event["iteration"]),
+            "intervention_id": event.get("intervention_id"),
+            "sampler_id": after.get("sampler_id"),
+            "state_version": after.get("state_version"),
+        }
+
+    def _gate_current_sampling_policy(
+        self, proposals: Sequence[ProgramProposal]
+    ) -> list[ProgramProposal]:
+        gated = []
+        for proposal in proposals:
+            if not self.sampling_policy_is_current(proposal.program):
+                gated.append(proposal)
+                continue
+            gated.append(replace(
+                proposal,
+                program=AdaptationProgram.keep(
+                    diagnosis="sampling_policy_already_active",
+                    reason="keep the existing fixed PDE cloud; effective sampling policy is unchanged",
+                ),
+                reason="current sampling policy gate",
+            ))
+            self.policy_population.last_repeat_gate_audit.append({
+                "policy_id": proposal.policy_id,
+                "status": "skipped_current_sampling_policy",
+                "reason": "sampling_policy_already_active",
+                "current_sampling_policy": deepcopy(self.current_sampling_policy),
+            })
+        return gated
 
     def set_initial_parameter_count(self, count: int) -> None:
         if self.initial_parameter_count is None:
@@ -3023,6 +3368,8 @@ class OnlineMorphController:
             return False, "disabled"
         if not first_order or not dynamic_objective_allowed:
             return False, "first_order_dynamic_stage_required"
+        if self.forced_initial_sampling_due(iteration):
+            return True, "mandatory_initial_sampling"
         interval = max(1, int(self.config["diagnostic_interval"]))
         if int(iteration) % interval:
             return False, "diagnostic_interval_not_reached"
@@ -3178,8 +3525,10 @@ class OnlineMorphController:
 
         state = self.adaptation_state(diagnostic)
         efficiency = dict((self.config.get("adaptive_strategy") or {}).get("llm_efficiency") or {})
-        if efficiency.get("enabled") and scoring_provider is not None:
-            scoring_provider = BudgetedProvider(scoring_provider, self.llm_budget_state, efficiency)
+        if scoring_provider is not None:
+            scoring_provider = BudgetedProvider(
+                scoring_provider, self.llm_budget_state, self.llm_budget_config()
+            )
         if continuation_forecast is not None:
             state["continuation_forecast"] = deepcopy(dict(continuation_forecast))
         if audit_continuation_forecast is not None:
@@ -3239,6 +3588,7 @@ class OnlineMorphController:
                 (),
             )
         proposals = self.policy_population.gate_uncredited_repeats(proposals)
+        proposals = self._gate_current_sampling_policy(proposals)
         if all(not proposal.program.has_intervention() for proposal in proposals):
             all_trigger_miss = all(
                 proposal.program.diagnosis == "policy_trigger_not_satisfied"
@@ -3249,6 +3599,9 @@ class OnlineMorphController:
             status = (
                 "all_candidates_inapplicable"
                 if all_trigger_miss
+                else "current_sampling_policy_unchanged"
+                if any(item.get("reason") == "sampling_policy_already_active"
+                       for item in self.policy_population.last_repeat_gate_audit)
                 else "all_candidates_explicit_keep"
             )
             scoring_audit = {
@@ -3270,6 +3623,8 @@ class OnlineMorphController:
                 reason=(
                     "every candidate condition missed; applicability repair requested"
                     if all_trigger_miss
+                    else "current sampling policy is already active; retain the fixed PDE cloud"
+                    if status == "current_sampling_policy_unchanged"
                     else "the policy population explicitly selected no structural change"
                 ),
             )
@@ -3329,7 +3684,7 @@ class OnlineMorphController:
                     keep_margin=float(((self.config.get("policy_set") or {}).get("scoring") or {}).get("keep_margin", DEFAULT_KEEP_BASELINE_MARGIN)),
                     proposals=proposals,
                 )
-                self.policy_scoring_calls += max(1, int(self.policy_population.last_selection_provider_calls))
+                self.policy_scoring_calls += int(self.policy_population.last_selection_provider_calls)
                 scoring_audit = deepcopy(self.policy_population.last_scoring_audit or {})
             scoring_audit["causal_repeat_gate"] = deepcopy(
                 self.policy_population.last_repeat_gate_audit
@@ -3343,27 +3698,34 @@ class OnlineMorphController:
             )
         except Exception as exc:
             if str(self.config.get("decision_mode")) != RANDOM_SELECTION_MODE:
-                self.policy_scoring_calls += max(1, int(self.policy_population.last_selection_provider_calls))
-            self.policy_scoring_failures += 1
+                self.policy_scoring_calls += int(self.policy_population.last_selection_provider_calls)
+            if not isinstance(exc, LLMBudgetExceeded):
+                self.policy_scoring_failures += 1
             error = f"{type(exc).__name__}: {exc}"
             scoring_audit = {
                 "scoring_source": "DUAL_LLM_2_MODEL",
-                "status": "failed_closed_to_keep",
+                "status": "budget_exhausted" if isinstance(exc, LLMBudgetExceeded) else "failed_closed_to_keep",
                 "error": error,
             }
             self.policy_scoring_events.append(
                 {"step": int(diagnostic.step), **deepcopy(scoring_audit)}
             )
+            decision_reason = (
+                str(exc) if isinstance(exc, LLMBudgetExceeded)
+                else "llm_candidate_scoring_unavailable"
+            )
             program = AdaptationProgram.keep(
-                diagnosis="llm_candidate_scoring_unavailable",
-                reason="independent candidate scoring failed; system failed closed",
+                diagnosis=decision_reason,
+                reason=("shared LLM budget exhausted; continue training"
+                        if isinstance(exc, LLMBudgetExceeded)
+                        else "independent candidate scoring failed; system failed closed"),
             )
             return OnlineMorphAction(
                 KEEP,
                 0,
                 0,
                 {
-                    "decision_reason": "llm_candidate_scoring_unavailable",
+                    "decision_reason": decision_reason,
                     "diagnostics": state,
                     "policy_selection": None,
                     "selected_policy_id": None,
@@ -3494,6 +3856,9 @@ class OnlineMorphController:
         for action in allowed_actions:
             try:
                 program = self._random_ablation_program(action)
+                if self.sampling_policy_is_current(program):
+                    rejected.append({"action": action, "reason": "sampling_policy_already_active"})
+                    continue
                 if action in OPTIMIZATION_ACTIONS:
                     compiled = ()
                 else:
@@ -3699,6 +4064,13 @@ class OnlineMorphController:
             )
         ):
             return None
+        budget_config = self.llm_budget_config()
+        call_limit = int(budget_config["maximum_calls"])
+        # Avoid starting a five-role generation that cannot finish, and leave
+        # room for one independent scoring round plus its possible tie-break.
+        scoring_reserve = 0 if str(self.config.get("decision_mode")) == RANDOM_SELECTION_MODE else 2
+        if call_limit > 0 and call_limit - self.llm_budget_state["calls"] < POLICY_POPULATION_SIZE + scoring_reserve:
+            return None
         if repair_due:
             self.policy_population.consume_applicability_repair()
         before = [item.policy_id for item in self.policy_population.policies]
@@ -3722,9 +4094,10 @@ class OnlineMorphController:
         if repair_due:
             event["applicability_repair"] = True
         try:
-            efficiency = dict((self.config.get("adaptive_strategy") or {}).get("llm_efficiency") or {})
-            if efficiency.get("enabled"):
-                provider = BudgetedProvider(provider, self.llm_budget_state, efficiency)
+            generation_budget = dict(budget_config)
+            if call_limit > 0:
+                generation_budget["maximum_calls"] = call_limit - scoring_reserve
+            provider = BudgetedProvider(provider, self.llm_budget_state, generation_budget)
             candidates = self.policy_population.evolve(
                 provider,
                 state=self.adaptation_state(diagnostic),
@@ -3746,9 +4119,6 @@ class OnlineMorphController:
                 ),
                 force=repair_due,
                 random_direction=random_direction,
-            )
-            self.policy_evolution_calls += int(
-                self.policy_population.last_evolution_provider_calls
             )
             population_event = (
                 self.policy_population.evolution_events[-1]
@@ -3782,10 +4152,11 @@ class OnlineMorphController:
                 }
             )
         except Exception as exc:
-            self.policy_evolution_failures += 1
+            if not isinstance(exc, LLMBudgetExceeded):
+                self.policy_evolution_failures += 1
             event.update(
                 {
-                    "status": "rejected",
+                    "status": "budget_exhausted" if isinstance(exc, LLMBudgetExceeded) else "rejected",
                     "error": f"{type(exc).__name__}: {exc}",
                     "capability_gaps": deepcopy(
                         self.policy_population.capability_gap_events[
@@ -3794,11 +4165,15 @@ class OnlineMorphController:
                     ),
                 }
             )
+        self.policy_evolution_calls += int(self.policy_population.last_evolution_provider_calls)
+        event["provider_calls"] = int(self.policy_population.last_evolution_provider_calls)
         self.policy_evolution_events.append(deepcopy(event))
         return event
 
     def adaptation_state(self, diagnostic):
         state = diagnostic.to_dict()
+        if self.current_sampling_policy:
+            state["current_sampling_policy"] = deepcopy(self.current_sampling_policy)
         config = dict(self.config.get("adaptive_strategy") or {})
         if config.get("bottleneck_enabled"):
             state["online_adaptation"] = bottleneck_contract(state, self.effective_allowed_primitives(diagnostic.step), config)
@@ -3863,7 +4238,7 @@ class OnlineMorphController:
         if not diagnostic.budget.remaining_budget_sufficient:
             return "insufficient_remaining_iterations"
         efficiency = dict((self.config.get("adaptive_strategy") or {}).get("llm_efficiency") or {})
-        reason = budget_reason(self.llm_budget_state, efficiency)
+        reason = budget_reason(self.llm_budget_state, self.llm_budget_config())
         if reason:
             return reason
         if unchanged_decision(self.adaptation_state(diagnostic), self.policy_population.generation, self.last_decision_observation, efficiency):
@@ -3933,6 +4308,10 @@ class OnlineMorphController:
                 "Applied interventions require policy_id and state_id attribution"
             )
         self.intervention_sequence += 1
+        sampling_whitelisted = program.action in SAMPLING_ACTIONS
+        executed_primitives = tuple(sorted(executed_primitive_names(event)))
+        whitelist_groups = rollback_whitelist_groups(event)
+        rollback_allowed = not bool(whitelist_groups)
         self.last_morph_iteration = int(iteration)
         self.morph_count += 1
         failure = self.operator_failure_history.setdefault(
@@ -3962,6 +4341,7 @@ class OnlineMorphController:
             program=program,
             start_step=int(iteration),
             state_before=deepcopy(dict(event.get("state_before") or {})),
+            executed_primitives=executed_primitives,
         )
         intervention_id = tracked.intervention_id
         policy_attribution = {
@@ -3988,8 +4368,45 @@ class OnlineMorphController:
             "short_feedback": None,
             "medium_feedback": None,
             "persistent_feedback": None,
+            "rollback_allowed": rollback_allowed,
+            "rollback_whitelist_groups": whitelist_groups,
+            "executed_primitives": executed_primitives,
         }
+        if sampling_whitelisted:
+            record.update(
+                short_due_step=None,
+                medium_due_step=None,
+                persistent_due_step=None,
+                feedback_exempt=True,
+            )
+            self.active_trial = None
+            self.current_morph_phase = "joint"
+            self.phase_remaining_iterations = 0
+            self.warmup_until_iteration = None
+            self.joint_transition_complete = True
+            self.last_completed_intervention_step = int(iteration)
+            stored = deepcopy(dict(event))
+            stored.update(
+                iteration=int(iteration),
+                intervention_id=intervention_id,
+                intervention_record=deepcopy(record),
+                feedback_status="whitelisted",
+                post_action_validation="skipped_sampling_whitelist",
+                rollback_allowed=False,
+                rollback_whitelist_groups=whitelist_groups,
+                executed_primitives=executed_primitives,
+                credit_eligible=False,
+            )
+            self.current_sampling_policy = self._sampling_policy_from_event(stored)
+            if event.get("forced_initial_sampling"):
+                self.forced_initial_sampling.update(status="applied", applied_step=int(iteration),
+                                                    intervention_id=intervention_id)
+            self.events.append(stored)
+            return deepcopy(stored)
         self.active_trial = {
+            "executed_primitives": executed_primitives,
+            "rollback_allowed": rollback_allowed,
+            "rollback_whitelist_groups": whitelist_groups,
             "intervention_id": intervention_id,
             "operator": operator,
             "insertion_step": int(iteration),
@@ -4040,6 +4457,9 @@ class OnlineMorphController:
         self.warmup_until_iteration = int(iteration) + activation + warmup
         self.joint_transition_complete = self.current_morph_phase in {"joint", "short_utility"}
         stored = deepcopy(dict(event))
+        stored["rollback_allowed"] = rollback_allowed
+        stored["rollback_whitelist_groups"] = whitelist_groups
+        stored["executed_primitives"] = executed_primitives
         stored["iteration"] = int(iteration)
         stored["intervention_id"] = intervention_id
         stored["intervention_record"] = deepcopy(record)
@@ -4228,6 +4648,8 @@ class OnlineMorphController:
         rolled_back: bool = False,
     ) -> dict[str, Any]:
         trial = deepcopy(dict(self.active_trial or {}))
+        if is_rollback_whitelisted(trial):
+            rolled_back = False
         applied = self._applied_event_for_intervention(trial)
         payload = dict(physics_utility or {})
         if "accepted" not in payload:
@@ -4334,6 +4756,7 @@ class OnlineMorphController:
             confounded=bool(intervening_trials),
         )
         feedback_event = {
+            "rollback_allowed": not is_rollback_whitelisted(evidence),
             "event": (
                 "HEURISTIC_PERSISTENT_FEEDBACK"
                 if recorded
@@ -4390,6 +4813,8 @@ class OnlineMorphController:
             "registered_loss_intervention": bool(self.registered_loss_intervention),
             "registered_optimization_intervention": bool(self.registered_optimization_intervention),
             "registered_sampling_intervention": bool(self.registered_sampling_intervention),
+            "current_sampling_policy": deepcopy(self.current_sampling_policy),
+            "forced_initial_sampling": deepcopy(self.forced_initial_sampling),
             "registered_curriculum_intervention": bool(self.registered_curriculum_intervention),
             "policy_population": self.policy_population.state_dict(),
             "intervention_tracker": self.intervention_tracker.state_dict(),
@@ -4409,6 +4834,9 @@ class OnlineMorphController:
         if state.get("intervention_tracker"):
             self.intervention_tracker.load_state_dict(state.get("intervention_tracker"))
         saved_budget = state.get("llm_budget_state") or {}
+        # Older checkpoints counted the roles but did not enable the wrapper.
+        legacy_calls = int(state.get("policy_evolution_calls") or 0) + int(state.get("policy_scoring_calls") or 0)
+        saved_budget = {**saved_budget, "calls": max(int(saved_budget.get("calls", 0)), legacy_calls)}
         for key in ("calls", "wall_seconds"):
             self.llm_budget_state[key] = max(self.llm_budget_state.get(key, 0), saved_budget.get(key, 0))
         self.last_decision_observation = deepcopy(state.get("last_decision_observation") or {})
@@ -4437,6 +4865,54 @@ class OnlineMorphController:
                 == "unregistered_adaptation_primitive"
             )
         ]
+        for event in self.events:
+            event["executed_primitives"] = tuple(sorted(executed_primitive_names(event)))
+            tracked = self.intervention_tracker.records.get(str(event.get("intervention_id") or ""))
+            if tracked is not None and event.get("iteration") is not None:
+                tracked.executed_primitives = event["executed_primitives"]
+                tracked.rollback_allowed = not is_rollback_whitelisted(event)
+                for shared in self.intervention_tracker.shared_history:
+                    if shared.get("intervention_id") == event.get("intervention_id"):
+                        shared["rollback_allowed"] = tracked.rollback_allowed
+            if is_rollback_whitelisted(event):
+                event["rollback_allowed"] = False
+                event["rollback_whitelist_groups"] = rollback_whitelist_groups(event)
+            if (
+                str(event.get("operator") or "") in SAMPLING_ACTIONS
+                and event.get("iteration") is not None
+            ):
+                event.update(
+                    post_action_validation="skipped_sampling_whitelist",
+                    rollback_allowed=False,
+                    credit_eligible=False,
+                )
+                if event.get("feedback_status") == "pending":
+                    event["feedback_status"] = "whitelisted"
+                record = event.get("intervention_record")
+                if isinstance(record, dict):
+                    record.update(
+                        short_due_step=None,
+                        medium_due_step=None,
+                        persistent_due_step=None,
+                        feedback_exempt=True,
+                    )
+        self.current_sampling_policy = deepcopy(state.get("current_sampling_policy"))
+        self.forced_initial_sampling = deepcopy(state.get("forced_initial_sampling") or {})
+        if self.current_sampling_policy is None:
+            # Legacy checkpoints contain the committed sampling events even
+            # though sampling is exempt from causal feedback histories.
+            applied_sampling = sorted(
+                (event for event in self.events
+                 if event.get("operator") in SAMPLING_ACTIONS
+                 and event.get("iteration") is not None),
+                key=lambda event: int(event["iteration"]), reverse=True,
+            )
+            if applied_sampling:
+                try:
+                    self.current_sampling_policy = self._sampling_policy_from_event(applied_sampling[0])
+                except (TypeError, ValueError):
+                    # An ambiguous legacy program must not block a legal change.
+                    self.current_sampling_policy = None
         self.diagnostic_events = deepcopy(state.get("diagnostic_events") or [])
         self.operator_failure_history = deepcopy(state.get("operator_failure_history") or {})
         self.operator_failure_history.pop(KEEP, None)
@@ -4455,20 +4931,28 @@ class OnlineMorphController:
         self.current_morph_phase = str(state.get("current_morph_phase") or "idle")
         self.phase_remaining_iterations = int(state.get("phase_remaining_iterations") or 0)
         loaded_active_trial = deepcopy(state.get("active_trial"))
-        discarded_keep_trial = bool(
+        discarded_exempt_trial = bool(
             isinstance(loaded_active_trial, Mapping)
-            and str(loaded_active_trial.get("operator") or "") == KEEP
+            and str(loaded_active_trial.get("operator") or "") in {KEEP, *SAMPLING_ACTIONS}
         )
-        self.active_trial = None if discarded_keep_trial else loaded_active_trial
+        self.active_trial = None if discarded_exempt_trial else loaded_active_trial
         self.pending_persistent_feedback = deepcopy(
             [
                 dict(item)
                 for item in state.get("pending_persistent_feedback") or []
                 if isinstance(item, Mapping)
-                and str(item.get("operator") or "") != KEEP
+                and str(item.get("operator") or "") not in {KEEP, *SAMPLING_ACTIONS}
             ]
         )
-        if discarded_keep_trial:
+        for trial in [self.active_trial, *self.pending_persistent_feedback]:
+            if trial is not None and not trial.get("executed_primitives"):
+                matched = next((event for event in self.events
+                                if event.get("intervention_id") == trial.get("intervention_id")), {})
+                trial["executed_primitives"] = matched.get("executed_primitives") or tuple(sorted(executed_primitive_names(trial)))
+            if trial is not None and is_rollback_whitelisted(trial):
+                trial["rollback_allowed"] = False
+                trial["rollback_whitelist_groups"] = rollback_whitelist_groups(trial)
+        if discarded_exempt_trial:
             self.current_morph_phase = "joint"
             self.phase_remaining_iterations = 0
         self.intervention_sequence = max(
@@ -4477,8 +4961,10 @@ class OnlineMorphController:
         )
         self._restore_intervention_ids()
         until = state.get("warmup_until_iteration")
-        self.warmup_until_iteration = int(until) if until is not None else None
-        self.joint_transition_complete = bool(
+        self.warmup_until_iteration = (
+            int(until) if until is not None and not discarded_exempt_trial else None
+        )
+        self.joint_transition_complete = discarded_exempt_trial or bool(
             state.get("joint_transition_complete", True)
         )
         self.gradient_conflict_history = [

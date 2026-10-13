@@ -29,6 +29,10 @@ from .controllers import (
     ReplaceSamplingSubsetAction,
     TrainerObservableState,
 )
+from .rollback_whitelist import (
+    ROLLBACK_ACTION_WHITELIST,
+    is_rollback_whitelisted,
+)
 from .adaptive_reporting import (
     AdaptiveComputeBudgetLedger,
     build_adaptive_control_summary,
@@ -71,6 +75,11 @@ from .validation_probe import (
 )
 from .online_diagnostics import build_physics_health_diagnostics
 from .intervention_tracker import FEEDBACK_HORIZONS
+from .sampling_runtime import (
+    SamplingBatch,
+    fixed_pde_cloud_counts,
+    sampling_policy_fractions,
+)
 
 
 def _bounded_event_log_payload(value: Any) -> Any:
@@ -642,6 +651,8 @@ class OpenSpecTrainer(AdaptiveOnlineMixin):
                 sum(parameter.numel() for parameter in self.built.model.parameters())
             )
         self.sampling_control_summary: dict[str, Any] = {
+            "post_action_validation": "skipped_sampling_whitelist",
+            "rollback_allowed": False,
             "sampling_diagnostic_evaluations": 0,
             "sampling_points_diagnosed": 0,
             "candidate_points_evaluated": 0,
@@ -1094,16 +1105,12 @@ class OpenSpecTrainer(AdaptiveOnlineMixin):
                         online_diagnostic_checkpoint = bool(
                             self.online_morph_controller is not None
                             and self.online_morph_controller.enabled
-                            and projected_iteration
-                            % max(
-                                1,
-                                int(
-                                    self.online_morph_controller.config[
-                                        "diagnostic_interval"
-                                    ]
-                                ),
+                            and (
+                                projected_iteration % max(1, int(
+                                    self.online_morph_controller.config["diagnostic_interval"]
+                                )) == 0
+                                or self.online_morph_controller.forced_initial_sampling_due(projected_iteration)
                             )
-                            == 0
                         )
                         self.built.loss_function.capture_residual_statistics = bool(
                             online_diagnostic_checkpoint
@@ -1485,21 +1492,9 @@ class OpenSpecTrainer(AdaptiveOnlineMixin):
                     in {"best_train_loss", "best_physics_validation"}
                     and self._pending_curriculum_observation is None
                 ):
-                    if self.best_training_loss_checkpoint_manager.restore_best_model(
-                        self.built.model
-                    ):
-                        self._selected_final_model_policy = (
-                            self.best_training_loss_checkpoint_manager.final_model_policy
-                        )
-                        restored_metadata = (
-                            self.best_training_loss_checkpoint_manager.best_metadata
-                            or {}
-                        )
-                        restored_training_loss = restored_metadata.get(
-                            "training_loss"
-                        )
-                        if restored_training_loss is not None:
-                            final_loss = float(restored_training_loss)
+                    restored_training_loss = self._restore_final_best_checkpoint()
+                    if restored_training_loss is not None:
+                        final_loss = restored_training_loss
                 if self.online_morph_controller is not None:
                     self._sync_online_morph_summary()
                     self.adaptive_control_summary[
@@ -2436,7 +2431,15 @@ class OpenSpecTrainer(AdaptiveOnlineMixin):
             math.isfinite(float(value))
             for value in after_audit_metrics.component_metrics.values()
         )
-        if not finite_feedback:
+        if not finite_feedback and is_rollback_whitelisted(trial):
+            physics_utility.update(
+                accepted=False,
+                credit_eligible=False,
+                reason="non_finite_physics_feedback",
+                rollback_allowed=False,
+            )
+            utility = 0.0
+        if not finite_feedback and not is_rollback_whitelisted(trial):
             attempted_step = int(trial.get("insertion_step") or self._actual_iterations)
             self._restore_online_morph_snapshot(snapshot)
             controller = self.online_morph_controller
@@ -2482,6 +2485,7 @@ class OpenSpecTrainer(AdaptiveOnlineMixin):
             self._online_morph_phase_wall_started = self._online_morph_timing_start()
             pending_event = {
                 "event": "HEURISTIC_SHORT_FEEDBACK",
+                "rollback_allowed": not is_rollback_whitelisted(trial),
                 "intervention_id": trial["intervention_id"],
                 "selected_policy_id": trial.get("selected_policy_id"),
                 "state_id": trial.get("state_id"),
@@ -2520,7 +2524,8 @@ class OpenSpecTrainer(AdaptiveOnlineMixin):
                 )
             )
             catastrophic = bool(
-                utility_config.get("catastrophic_rollback_enabled", True)
+                not is_rollback_whitelisted(trial)
+                and utility_config.get("catastrophic_rollback_enabled", True)
                 and math.isfinite(raw_degradation)
                 and raw_degradation > catastrophic_threshold
             )
@@ -2531,6 +2536,8 @@ class OpenSpecTrainer(AdaptiveOnlineMixin):
                     physics_utility, self._adaptive_config()["trial_control"].get("safety_degradation", 0.1)).safe)
             else:
                 adaptive_rejection = bool(trial.get("adaptive_trial") and physics_utility.get("credit_eligible") and not physics_utility.get("accepted"))
+            if is_rollback_whitelisted(trial):
+                adaptive_rejection = False
             physical_catastrophic = catastrophic
             if not catastrophic and not adaptive_rejection:
                 self._update_adaptive_trial(controller.active_trial, physics_utility, "medium")
@@ -2632,7 +2639,10 @@ class OpenSpecTrainer(AdaptiveOnlineMixin):
                     else "online_heuristic_medium_feedback"
                 ),
                 trigger=feedback_event,
-                rollback_status="completed" if catastrophic else "not_required",
+                rollback_status=(
+                    "disabled_by_whitelist" if is_rollback_whitelisted(trial)
+                    else "completed" if catastrophic else "not_required"
+                ),
             )
         if not self._adaptive_trial_pending():
             self._pending_online_morph_snapshot = None
@@ -2737,6 +2747,7 @@ class OpenSpecTrainer(AdaptiveOnlineMixin):
                 applied_program = dict(trial.get("adaptation_program") or {})
                 objective_failed = bool(
                     not restored_persistent
+                    and not is_rollback_whitelisted(trial)
                     and
                     not trial.get("adaptive_trial")
                     and applied_program.get("action") in OBJECTIVE_ACTIONS
@@ -2763,6 +2774,7 @@ class OpenSpecTrainer(AdaptiveOnlineMixin):
                         }
                 if (
                     not restored_persistent
+                    and not is_rollback_whitelisted(trial)
                     and not trial.get("adaptive_trial")
                     and not bool(
                         persistent_event.get("confounded_by_intervention_ids")
@@ -2806,8 +2818,15 @@ class OpenSpecTrainer(AdaptiveOnlineMixin):
             except Exception as exc:
                 if trial.get("adaptive_trial") and self._pending_online_morph_snapshot is not None:
                     # Never release checkpoint eligibility with an unresolved failed trial.
-                    failure_event = {"event": "ADAPTIVE_OBSERVATION_ERROR_ROLLBACK", "step": self._actual_iterations,
-                        "intervention_id": intervention_id, "error": f"{type(exc).__name__}: {exc}"}
+                    failure_event = {
+                        "event": ("ADAPTIVE_OBSERVATION_ERROR_RETAINED"
+                                  if is_rollback_whitelisted(trial)
+                                  else "ADAPTIVE_OBSERVATION_ERROR_ROLLBACK"),
+                        "rollback_allowed": not is_rollback_whitelisted(trial),
+                        "step": self._actual_iterations,
+                        "intervention_id": intervention_id,
+                        "error": f"{type(exc).__name__}: {exc}",
+                    }
                     self._finish_adaptive_trial(trial, {}, failure_event)
                     self._append_morph_event_record(failure_event)
                 self._append_morph_event_record(
@@ -2842,7 +2861,7 @@ class OpenSpecTrainer(AdaptiveOnlineMixin):
         """
         controller = self.online_morph_controller
         snapshot = getattr(self, "_pending_online_morph_snapshot", None)
-        if (trial.get("adaptive_trial") or snapshot is None
+        if (is_rollback_whitelisted(trial) or trial.get("adaptive_trial") or snapshot is None
                 or not controller.config.get("block_new_morph_until_persistent_feedback", False)
                 or not feedback.get("credit_eligible") or feedback.get("accepted")
                 or event.get("duplicate_ignored") or event.get("confounded_by_intervention_ids")
@@ -3029,7 +3048,7 @@ class OpenSpecTrainer(AdaptiveOnlineMixin):
         )
         new_projection_strength = old_projection_strength
         point_weighting_request: tuple[str, float] | None = None
-        gradnorm_request: tuple[float, int] | None = None
+        gradnorm_request: tuple[float, int, float, float] | None = None
 
         for plan in plans:
             parameters = dict(plan.parameters or {})
@@ -3057,6 +3076,8 @@ class OpenSpecTrainer(AdaptiveOnlineMixin):
                     gradnorm_request = (
                         float(parameters.get("adaptation_rate", strength)),
                         10,
+                        minimum_weight,
+                        maximum_weight,
                     )
             elif plan.action == REWEIGHT_RESIDUAL_REGIONS:
                 # Region probes identify where the failure is concentrated;
@@ -3143,6 +3164,8 @@ class OpenSpecTrainer(AdaptiveOnlineMixin):
                 configure(
                     strength=gradnorm_request[0],
                     update_every=gradnorm_request[1],
+                    minimum_weight=gradnorm_request[2],
+                    maximum_weight=gradnorm_request[3],
                 )
         self._pending_online_morph_snapshot = pre_action_snapshot
         self._active_morph_result = None
@@ -3230,21 +3253,30 @@ class OpenSpecTrainer(AdaptiveOnlineMixin):
         audit_continuation_forecast: Mapping[str, Any],
         started_at: float,
     ) -> dict[str, Any] | None:
-        """Execute an EOH-selected fixed-budget collocation redistribution."""
+        """Commit the LLM's local/global allocation as a fixed cloud, without a trial."""
 
         controller = self.online_morph_controller
+        forced = bool(action.reason.get("forced_initial_sampling"))
         sampler = getattr(self.built, "sampler", None)
-        if (
-            controller is None
-            or sampler is None
-            or self.registry is None
-            or before_physics_metrics is None
-            or before_audit_metrics is None
-        ):
+        if controller is None or sampler is None or self.registry is None:
+            if forced:
+                raise RuntimeError("Mandatory sampling runtime is unavailable")
             if controller is not None:
                 controller.reject_policy_candidate(
-                    action, reason="sampling_runtime_or_physics_baseline_unavailable"
+                    action, reason="sampling_runtime_unavailable"
                 )
+            return None
+        rollback_manager = getattr(self, "rollback_manager", None)
+        if (
+            getattr(controller, "active_trial", None)
+            or getattr(controller, "pending_persistent_feedback", ())
+            or (rollback_manager is not None and rollback_manager.active_checkpoint_id is not None)
+        ):
+            if forced:
+                raise RuntimeError("Mandatory sampling cannot run while another execution transaction is pending")
+            controller.reject_policy_candidate(
+                action, reason="another_intervention_observation_pending"
+            )
             return None
         program_payload = action.reason.get("adaptation_program")
         if not isinstance(program_payload, Mapping):
@@ -3254,6 +3286,15 @@ class OpenSpecTrainer(AdaptiveOnlineMixin):
             return None
         try:
             program = AdaptationProgram.from_dict(program_payload)
+            is_current = getattr(controller, "sampling_policy_is_current", None)
+            if not forced and callable(is_current) and is_current(program):
+                self._append_morph_event_record({
+                    "event": "SAMPLING_ACTION_SKIPPED_CURRENT_POLICY",
+                    "step": self._actual_iterations,
+                    "operator": KEEP,
+                    "reason": "sampling_policy_already_active",
+                })
+                return None
             plans, compilation_audit = (
                 controller.safe_execution_engine.compile_with_audit(
                     program, diagnostic
@@ -3263,107 +3304,42 @@ class OpenSpecTrainer(AdaptiveOnlineMixin):
                 raise ValueError("sampling policy must compile to one sampling primitive")
             plan = plans[0]
             parameters = dict(plan.parameters or {})
-            if self._adaptive_config().get("progressive_enabled"):
-                parameters["replacement_fraction"] = min(0.05, float(parameters.get("replacement_fraction", 0.2)))
-            if plan.target in {"boundary_regions", "interface_regions"}:
-                redistribute = getattr(
-                    sampler, "redistribute_budget_to_constraints", None
-                )
-                if not callable(redistribute):
-                    raise RuntimeError("constraint budget redistribution is unavailable")
-                pre_action_snapshot = self._capture_online_morph_snapshot()
-                allocation = redistribute(
-                    target=plan.target,
-                    fraction=float(
-                        parameters.get(
-                            "replacement_fraction",
-                            max(0.05, 0.30 * program.strength),
-                        )
-                    ),
-                )
-                mutation = SimpleNamespace(
-                    sampler_id=str(allocation["target_sampler_id"]),
-                    points_replaced=int(allocation["points_moved"]),
-                    point_count_after=int(allocation["constraint_after"]),
-                    state_version_after=0,
-                )
-                sampling_action = ReplaceSamplingSubsetAction(
-                    action_type="replace_sampling_subset",
-                    controller="eoh_online_policy",
-                    sampler_id=mutation.sampler_id,
-                    replacement_fraction=float(
-                        parameters.get("replacement_fraction", 0.1)
-                    ),
-                    hard_point_retention_fraction=0.0,
-                    exploration_fraction=0.0,
-                    scoring_component_ids=(),
-                    score_statistics={},
-                    candidate_count=0,
-                    requested_compute_budget=0,
-                    sampler_state_version=0,
-                    before={
-                        "interior_count": allocation["interior_before"],
-                        "constraint_count": allocation["constraint_before"],
-                    },
-                    after={**allocation, "target": plan.target},
-                    reason={
-                        "source": "eoh_online_policy",
-                        "region_target": plan.target,
-                    },
-                    limits={"fixed_total_point_budget": True},
-                )
-            else:
-                allocation = None
             descriptors = [
-                item
-                for item in self.registry.sampling_components
-                if item.replacement_supported
+                item for item in self.registry.sampling_components
+                if item.domain_role == "interior"
+                and item.replacement_supported
                 and item.pointwise_scoring_supported
                 and item.candidate_generation_supported
             ]
-            if allocation is None and not descriptors:
-                raise RuntimeError("no registered mutable pointwise sampler")
-            descriptor = sorted(
-                descriptors,
-                key=lambda item: (
-                    item.domain_role != "interior", item.sampler_id
-                ),
-            )[0] if descriptors else None
-            if allocation is not None:
-                current = None
-            else:
-                current = sampler.get_training_points(descriptor.sampler_id)
-            if allocation is None:
-                scored = sampler.score_points(
-                    self.built.model,
-                    descriptor.associated_loss_component_ids,
-                    current,
-                    None,
-                )
-                self._sampling_score_cache[descriptor.sampler_id] = (current, scored)
-                replacement_fraction = float(
-                    parameters.get("replacement_fraction", max(0.05, 0.30 * program.strength))
-                )
-                exploration_fraction = float(
-                    parameters.get("exploration_fraction", 0.10)
-                )
-                candidate_multiplier = int(parameters.get("candidate_multiplier", 4))
-                replacement_count = max(
-                    1, int(current.point_count * replacement_fraction)
-                )
-                candidate_count = max(
-                    replacement_count, replacement_count * candidate_multiplier
-                )
-                sampling_action = ReplaceSamplingSubsetAction(
+            if not descriptors:
+                raise RuntimeError("no registered mutable PDE pointwise sampler")
+            descriptor = sorted(descriptors, key=lambda item: item.sampler_id)[0]
+            current = sampler.get_training_points(descriptor.sampler_id)
+            scored = sampler.score_points(
+                self.built.model,
+                descriptor.associated_loss_component_ids,
+                current,
+                None,
+            )
+            self._sampling_score_cache[descriptor.sampler_id] = (current, scored)
+            active_policy = dict((getattr(controller, "current_sampling_policy", None) or {}).get("policy") or {})
+            local_fraction, global_fraction = sampling_policy_fractions(
+                parameters, default_local_fraction=float(active_policy.get("local_fraction", 0.7))
+            )
+            target_point_count = int(parameters.get("point_count", current.point_count))
+            if target_point_count <= 0:
+                raise ValueError("point_count must be a positive integer")
+            local_count, global_count = fixed_pde_cloud_counts(target_point_count, local_fraction)
+            candidate_multiplier = max(1, int(parameters.get("candidate_multiplier", active_policy.get("candidate_multiplier", 4))))
+            candidate_count = max(1, local_count * candidate_multiplier)
+            sampling_action = ReplaceSamplingSubsetAction(
                 action_type="replace_sampling_subset",
                 controller="eoh_online_policy",
                 sampler_id=descriptor.sampler_id,
-                replacement_fraction=replacement_fraction,
-                hard_point_retention_fraction=0.20,
-                exploration_fraction=exploration_fraction,
-                scoring_component_ids=tuple(
-                    descriptor.associated_loss_component_ids
-                ),
+                replacement_fraction=local_fraction,
+                hard_point_retention_fraction=0.0,
+                exploration_fraction=global_fraction,
+                scoring_component_ids=tuple(descriptor.associated_loss_component_ids),
                 score_statistics=dict(scored.statistics),
                 candidate_count=candidate_count,
                 requested_compute_budget=candidate_count,
@@ -3372,20 +3348,25 @@ class OpenSpecTrainer(AdaptiveOnlineMixin):
                     "point_count": current.point_count,
                     "sampler_state_version": current.state_version,
                 },
-                after={"target": plan.target},
+                after={
+                    "target": plan.target,
+                    "point_count": target_point_count,
+                    "local_points": local_count,
+                    "global_points": global_count,
+                },
                 reason={
                     "source": "eoh_online_policy",
                     "region_target": plan.target,
+                    "local_fraction": local_fraction,
+                    "global_fraction": global_fraction,
+                    "point_count": target_point_count,
                 },
-                limits={
-                    "maximum_point_age": 20,
-                    "maximum_consecutive_retention": 5,
-                    "minimum_point_age": 0,
-                },
-                )
-                pre_action_snapshot = self._capture_online_morph_snapshot()
-                mutation = self._execute_sampling_action(sampling_action)
+                limits={"fixed_total_point_budget": False, "llm_point_count_override": True},
+            )
+            mutation = self._execute_sampling_action(sampling_action)
         except Exception as exc:
+            if forced:
+                raise RuntimeError(f"Mandatory LLM sampling execution failed: {exc}") from exc
             controller.reject_policy_candidate(
                 action,
                 reason=f"sampling_execution_failed:{type(exc).__name__}:{exc}"[:500],
@@ -3395,36 +3376,42 @@ class OpenSpecTrainer(AdaptiveOnlineMixin):
             ) + 1
             return None
 
-        self._pending_online_morph_snapshot = pre_action_snapshot
+        self._pending_online_morph_snapshot = None
         self._active_morph_result = None
         parameter_count = sum(
             parameter.numel() for parameter in self.built.model.parameters()
         )
-        compilation_audit["executed_operations"] = [
-            item.to_dict() for item in plans
-        ]
+        compilation_audit["executed_operations"] = [item.to_dict() for item in plans]
+        compilation_audit["effective_sampling_rule"] = {
+            "local_fraction": local_fraction,
+            "global_fraction": global_fraction,
+            "candidate_multiplier": candidate_multiplier,
+            "point_count": target_point_count,
+            "local_points": local_count,
+            "global_points": global_count,
+            "fixed_between_actions": True,
+        }
         compilation_audit["transaction_status"] = "committed"
         event = {
             "operator": action.operator,
             "intervention_class": action.intervention_class,
             "non_structural": True,
+            "post_action_validation": "skipped_sampling_whitelist",
+            "rollback_allowed": False,
             "adaptation_program": program.to_dict(),
+            "forced_initial_sampling": forced,
             "policy_selection": deepcopy(action.reason.get("policy_selection") or {}),
             "selected_policy_id": action.reason.get("selected_policy_id"),
             "state_id": action.reason.get("state_id"),
             "state_before": diagnostic.to_dict(),
-            "morph_before_physics_metrics": before_physics_metrics.to_dict(),
-            "morph_before_audit_physics_metrics": before_audit_metrics.to_dict(),
-            "continuation_forecast": deepcopy(dict(continuation_forecast or {})),
-            "audit_continuation_forecast": deepcopy(
-                dict(audit_continuation_forecast or {})
-            ),
             "architecture_before": dict(sampling_action.before),
             "architecture_after": {
                 "sampler_id": mutation.sampler_id,
                 "points_replaced": mutation.points_replaced,
                 "point_count": mutation.point_count_after,
                 "state_version": mutation.state_version_after,
+                "local_points": local_count,
+                "global_points": global_count,
                 "region_target": plan.target,
             },
             "old_parameter_count": parameter_count,
@@ -3437,7 +3424,6 @@ class OpenSpecTrainer(AdaptiveOnlineMixin):
             "continued_without_restart": True,
         }
         applied = controller.mark_applied(self._actual_iterations, event)
-        self._initialize_adaptive_trial(applied)
         self.adaptive_control_summary["online_morphs_applied"] = int(
             self.adaptive_control_summary.get("online_morphs_applied", 0)
         ) + 1
@@ -3445,9 +3431,7 @@ class OpenSpecTrainer(AdaptiveOnlineMixin):
         self.sampling_control_summary["sampling_points_replaced"] += int(
             mutation.points_replaced
         )
-        self._append_morph_event_record(
-            {"event": "SAMPLING_ACTION_APPLIED", **applied}
-        )
+        self._append_morph_event_record({"event": "SAMPLING_ACTION_APPLIED", **applied})
         self._emit_adaptive_audit(
             iteration=self._actual_iterations,
             stage=str(phase.name),
@@ -3488,6 +3472,7 @@ class OpenSpecTrainer(AdaptiveOnlineMixin):
         )
         if not due:
             return None
+        forced_initial_sampling = controller.forced_initial_sampling_due(self._actual_iterations)
         morph_control_started = time.perf_counter()
         pde_component_ids = tuple(
             item.component_id
@@ -3573,7 +3558,7 @@ class OpenSpecTrainer(AdaptiveOnlineMixin):
         self.adaptive_control_summary["online_morph_diagnostics"] = int(
             controller.diagnostic_count
         )
-        if str(controller.config.get("decision_mode")) in {"llm_evolution", "random_selection"}:
+        if not forced_initial_sampling and str(controller.config.get("decision_mode")) in {"llm_evolution", "random_selection"}:
             evolution_event = controller.maybe_evolve_policy(
                 diagnostic, self.online_policy_generation_provider
             )
@@ -3584,23 +3569,22 @@ class OpenSpecTrainer(AdaptiveOnlineMixin):
                 self._append_capability_gap_records(
                     list(evolution_event.get("capability_gaps") or ())
                 )
-        continuation_forecast: dict[str, Any] | None = None
-        continuation_started = self._online_morph_timing_start()
-        continuation_forecast = controller.build_continuation_forecast(
-            self._actual_iterations,
-        )
-        audit_continuation_forecast = controller.build_audit_continuation_forecast(
-            self._actual_iterations,
-        )
-        self._record_online_morph_timing(
-            "continuation_fit", continuation_started
-        )
-        action = controller.propose_action(
-            diagnostic,
-            self.online_candidate_scoring_provider,
-            continuation_forecast=continuation_forecast,
-            audit_continuation_forecast=audit_continuation_forecast,
-        )
+        if forced_initial_sampling:
+            continuation_forecast = {}
+            audit_continuation_forecast = {}
+            action = controller.propose_forced_initial_sampling(
+                diagnostic, self.online_policy_generation_provider
+            )
+        else:
+            continuation_started = self._online_morph_timing_start()
+            continuation_forecast = controller.build_continuation_forecast(self._actual_iterations)
+            audit_continuation_forecast = controller.build_audit_continuation_forecast(self._actual_iterations)
+            self._record_online_morph_timing("continuation_fit", continuation_started)
+            action = controller.propose_action(
+                diagnostic, self.online_candidate_scoring_provider,
+                continuation_forecast=continuation_forecast,
+                audit_continuation_forecast=audit_continuation_forecast,
+            )
         required_forecast_steps = (
             self._actual_iterations + FEEDBACK_HORIZONS["short"],
             self._actual_iterations + FEEDBACK_HORIZONS["medium"],
@@ -4314,6 +4298,9 @@ class OpenSpecTrainer(AdaptiveOnlineMixin):
         if not new_ids:
             raise RuntimeError("Online morph registered no trainable parameters")
         applied = controller.mark_applied(self._actual_iterations, event)
+        event.update({key: applied[key] for key in (
+            "rollback_allowed", "rollback_whitelist_groups", "executed_primitives",
+        )})
         morphable.bind_latest_intervention_id(str(applied["intervention_id"]))
         if controller.active_trial is not None:
             controller.active_trial[
@@ -4533,6 +4520,7 @@ class OpenSpecTrainer(AdaptiveOnlineMixin):
         action_signature = self._action_signature(action)
         if (
             self.rollback_manager is not None
+            and action.action_type not in ROLLBACK_ACTION_WHITELIST
             and action_signature
             in self.rollback_manager.failed_action_signatures
         ):
@@ -4899,8 +4887,11 @@ class OpenSpecTrainer(AdaptiveOnlineMixin):
             self.online_morph_controller.load_state_dict(
                 payload.get("online_morph_controller_state")
             )
-            self._pending_online_morph_snapshot = deepcopy(
-                payload.get("pending_online_morph_snapshot")
+            self._pending_online_morph_snapshot = (
+                deepcopy(payload.get("pending_online_morph_snapshot"))
+                if (self.online_morph_controller.active_trial
+                    or self.online_morph_controller.pending_persistent_feedback)
+                else None
             )
             self._active_morph_result = self.morphable_model.latest_morph_result()
             self._restore_online_morph_trainability()
@@ -4988,12 +4979,19 @@ class OpenSpecTrainer(AdaptiveOnlineMixin):
             self.fixed_budget_sampling_controller.load_state_dict(
                 payload.get("fixed_budget_sampling_controller_state")
             )
-        self._pending_sampling_observation = deepcopy(
-            payload.get("pending_sampling_observation")
-        )
+        self._pending_sampling_observation = None
+        if (
+            self.rollback_manager is not None
+            and str(self.rollback_manager.active_checkpoint_id or "").startswith("pre_sampling_action")
+        ):
+            self.rollback_manager.clear()
         self.sampling_control_summary = dict(
             payload.get("sampling_control_summary")
             or self.sampling_control_summary
+        )
+        self.sampling_control_summary.update(
+            post_action_validation="skipped_sampling_whitelist",
+            rollback_allowed=False,
         )
         runtime_states = payload.get("curriculum_runtime_states")
         runtime_headers = payload.get("curriculum_runtime_state_headers") or {}
@@ -5060,12 +5058,13 @@ class OpenSpecTrainer(AdaptiveOnlineMixin):
     def _save_pre_action_checkpoint(
         self, action: AdaptiveAction, loss: float | None
     ) -> str | None:
-        if self.rollback_manager is None:
+        if (
+            self.rollback_manager is None
+            or action.action_type in ROLLBACK_ACTION_WHITELIST
+        ):
             return None
         prefix = (
-            "pre_sampling_action"
-            if action.action_type == "replace_sampling_subset"
-            else "pre_curriculum_advance"
+            "pre_curriculum_advance"
             if action.action_type == "advance_curriculum_state"
             else "pre_action"
         )
@@ -5139,6 +5138,10 @@ class OpenSpecTrainer(AdaptiveOnlineMixin):
         if payload is None:
             return
         active_action_type = str(payload.get("active_action_type") or "")
+        if active_action_type in ROLLBACK_ACTION_WHITELIST:
+            manager.clear()
+            self._pending_sampling_observation = None
+            return
         active_action_metadata = dict(payload.get("active_action_metadata") or {})
         consumed_sampling = deepcopy(self.sampling_control_summary)
         sampling_updates = (
@@ -5727,6 +5730,20 @@ class OpenSpecTrainer(AdaptiveOnlineMixin):
             "used_for_acceptance": False,
         }
 
+    def _restore_final_best_checkpoint(self) -> float | None:
+        manager = self.best_training_loss_checkpoint_manager
+        if manager.restore_best_model(self.built.model):
+            self._selected_final_model_policy = manager.final_model_policy
+            self.adaptive_control_summary.pop("checkpoint_selection_fallback", None)
+            value = (manager.best_metadata or {}).get("training_loss")
+            return float(value) if value is not None else None
+        self._selected_final_model_policy = "last"
+        self.adaptive_control_summary["checkpoint_selection_fallback"] = {
+            "reason": "no_eligible_best_checkpoint",
+            "initial_condition_guard": deepcopy(manager.last_initial_condition_guard),
+        }
+        return None
+
     def _maybe_run_physics_validation(
         self,
         *,
@@ -5803,12 +5820,28 @@ class OpenSpecTrainer(AdaptiveOnlineMixin):
                 training_loss=training_loss,
                 physics_validation_score=float(audit_result.aggregate_score),
                 score_context=manager.audit_score_context(),
+                initial_condition_scores=(
+                    {
+                        component.component_id: audit_result.normalized_component_scores.get(
+                            component.component_id
+                        )
+                        for component in self.registry.loss_components
+                        if component.category == "initial_constraint"
+                    }
+                    if any(component.category == "initial_constraint"
+                           for component in self.registry.loss_components)
+                    else None
+                ),
                 iteration=self._actual_iterations,
                 stage_id=stage_id,
                 algorithm_spec_id=self._algorithm_spec_id,
                 directory=self.checkpoint_dir,
             )
         )
+        if checkpoint_manager is not None:
+            self.adaptive_control_summary["checkpoint_initial_condition_guard"] = deepcopy(
+                checkpoint_manager.last_initial_condition_guard
+            )
         self._observe_adaptive_time_progress()
         self._observe_directional_frequency()
         self._assess_pending_sampling_action(result, phase)
@@ -5838,6 +5871,10 @@ class OpenSpecTrainer(AdaptiveOnlineMixin):
             after={
                 "best_train_checkpoint_updated": training_loss_updated,
                 "best_physics_checkpoint_updated": physics_checkpoint_updated,
+                "checkpoint_initial_condition_guard": deepcopy(
+                    checkpoint_manager.last_initial_condition_guard
+                    if checkpoint_manager is not None else {}
+                ),
             },
         )
 
@@ -5863,6 +5900,7 @@ class OpenSpecTrainer(AdaptiveOnlineMixin):
                 self._actual_iterations
             )
         )
+        online_controller = getattr(self, "online_morph_controller", None)
         return TrainerObservableState(
             iteration=int(self._actual_iterations),
             stage=str(phase.name),
@@ -5882,8 +5920,10 @@ class OpenSpecTrainer(AdaptiveOnlineMixin):
                 "remaining_candidate_points": max(0, maximum - consumed),
             },
             pending_rollback=bool(
-                self.rollback_manager is not None
-                and self.rollback_manager.active_checkpoint_id is not None
+                (self.rollback_manager is not None
+                 and self.rollback_manager.active_checkpoint_id is not None)
+                or getattr(online_controller, "active_trial", None)
+                or getattr(online_controller, "pending_persistent_feedback", ())
             ),
             coordinator_observation_active=coordinator_active,
         )
@@ -5985,7 +6025,6 @@ class OpenSpecTrainer(AdaptiveOnlineMixin):
                 )
                 return
             action = selected
-        checkpoint_id = self._save_pre_action_checkpoint(action, None)
         try:
             mutation = self.apply_validated_action(action, observable_state=state)
         except Exception as exc:
@@ -6002,53 +6041,28 @@ class OpenSpecTrainer(AdaptiveOnlineMixin):
                 trigger={"error": f"{type(exc).__name__}: {exc}"},
                 before=dict(action.before),
                 after=dict(action.after),
-                checkpoint_id=checkpoint_id,
             )
-            if (
-                self.rollback_manager is not None
-                and self.rollback_manager.active_checkpoint_id is not None
-            ):
-                self._rollback_active_action(
-                    phase=phase, reason="sampling_action_execution_failed"
-                )
             return
         controller.mark_action_applied(self._actual_iterations)
         if self.controller_coordinator is not None:
             self.controller_coordinator.record_outcome(
                 action, iteration=self._actual_iterations, outcome="applied"
             )
-            self.controller_coordinator.extend_observation_window(
-                self._actual_iterations
-                + int(controller.config["observation_window_iterations"])
-            )
         self.sampling_control_summary["sampling_updates_executed"] += 1
         self.sampling_control_summary["sampling_points_replaced"] += int(
             mutation.points_replaced
         )
-        baseline = getattr(self.validation_probe_manager, "last_result", None)
-        self._pending_sampling_observation = {
-            "action_signature": (
-                self.controller_coordinator.action_signature(action)
-                if self.controller_coordinator is not None
-                else self._action_signature(action)
-            ),
-            "sampler_id": action.sampler_id,
-            "associated_component_ids": list(action.scoring_component_ids),
-            "start_iteration": int(self._actual_iterations),
-            "validation_checks": 0,
-            "degradation_checks": 0,
-            "baseline": baseline.to_dict() if baseline is not None else None,
-            "checkpoint_id": (
-                self.rollback_manager.active_checkpoint_id
-                if self.rollback_manager is not None else None
-            ),
-        }
+        self._pending_sampling_observation = None
         self._emit_adaptive_audit(
             iteration=self._actual_iterations,
             stage=str(phase.name),
             controller=controller.name,
             event_type="action_applied",
-            trigger=dict(action.reason),
+            trigger={
+                **dict(action.reason),
+                "post_action_validation": "skipped_sampling_whitelist",
+                "rollback_allowed": False,
+            },
             before=dict(action.before),
             after={
                 **dict(action.after),
@@ -6057,134 +6071,75 @@ class OpenSpecTrainer(AdaptiveOnlineMixin):
                 "sampler_state_version": mutation.state_version_after,
             },
             limits=dict(action.limits),
-            checkpoint_id=checkpoint_id,
         )
 
     def _execute_sampling_action(
         self, action: ReplaceSamplingSubsetAction
     ) -> Any:
+        """Rebuild the complete PDE cloud using the requested local/global allocation."""
         compute_started = time.perf_counter()
         sampler = self.built.sampler
         cached = self._sampling_score_cache.get(action.sampler_id)
         if cached is None:
             raise RuntimeError("Sampling action score cache is unavailable or stale")
-        current, current_scores = cached
+        current, _ = cached
         if int(current.state_version) != int(action.sampler_state_version):
             raise RuntimeError("Sampler state changed before action execution")
-        count = current.point_count
-        replacement_count = max(1, int(count * action.replacement_fraction))
-        hard_count = min(
-            count - replacement_count,
-            int(count * action.hard_point_retention_fraction),
-        )
-        scores = current_scores.scores.detach().cpu()
-        ranked_high = torch.argsort(scores, descending=True).tolist()
-        metadata = list(current.point_metadata)
-        maximum_age = int(action.limits.get("maximum_point_age", 20))
-        maximum_retention = int(
-            action.limits.get("maximum_consecutive_retention", 5)
-        )
-        minimum_age = int(action.limits.get("minimum_point_age", 0))
-        hard = [
-            index for index in ranked_high
-            if int(metadata[index].get("age", 0)) <= maximum_age
-            and int(metadata[index].get("consecutive_retention_count", 0))
-            <= maximum_retention
-        ][:hard_count]
-        protected = set(hard)
-        ranked_low = torch.argsort(scores, descending=False).tolist()
-        forced_release = [
-            index for index in range(count)
-            if int(metadata[index].get("age", 0)) > maximum_age
-            or int(metadata[index].get("consecutive_retention_count", 0))
-            > maximum_retention
-        ]
-        forced_release.sort(
-            key=lambda index: (
-                -int(metadata[index].get("age", 0)),
-                -int(metadata[index].get("consecutive_retention_count", 0)),
-                index,
+        local_fraction, _ = sampling_policy_fractions({
+            "local_fraction": action.reason.get("local_fraction", action.replacement_fraction),
+            "global_fraction": action.reason.get("global_fraction", action.exploration_fraction),
+        })
+        target_point_count = int(action.reason.get("point_count", current.point_count))
+        if target_point_count <= 0:
+            raise ValueError("Sampling point_count must be positive")
+        local_count, global_count = fixed_pde_cloud_counts(target_point_count, local_fraction)
+        local_points = current.points[:0]
+        metadata = ()
+        if local_count:
+            candidates = sampler.generate_candidate_points(
+                action.sampler_id, action.candidate_count
             )
-        )
-        replace_indices = forced_release[:replacement_count]
-        replace_indices.extend(
-            index for index in ranked_low
-            if index not in protected
-            and index not in replace_indices
-            and int(metadata[index].get("age", 0)) >= minimum_age
-        )
-        replace_indices = replace_indices[:replacement_count]
-        if len(replace_indices) < replacement_count:
-            replace_indices.extend(
-                index for index in ranked_low
-                if index not in protected and index not in replace_indices
+            self.sampling_control_summary["candidate_points_evaluated"] += int(
+                action.candidate_count
             )
-        if len(replace_indices) < replacement_count:
-            replace_indices.extend(
-                index for index in ranked_low if index not in replace_indices
+            candidate_scores = sampler.score_points(
+                self.built.model,
+                action.scoring_component_ids,
+                candidates,
+                None,
             )
-        replace_indices = replace_indices[:replacement_count]
-        retained_indices = [
-            index for index in range(count) if index not in set(replace_indices)
-        ]
-        candidates = sampler.generate_candidate_points(
-            action.sampler_id, action.candidate_count
-        )
-        self.sampling_control_summary["candidate_points_evaluated"] += int(
-            action.candidate_count
-        )
-        candidate_scores = sampler.score_points(
-            self.built.model,
-            action.scoring_component_ids,
-            candidates,
-            None,
-        )
-        candidate_ranking_scores = candidate_scores.scores.detach().cpu().clone()
-        if str(action.reason.get("region_target") or "") == "boundary_regions":
-            # Boundary-aware interior refinement: retain the registered PDE
-            # point score while favoring candidates close to the empirical
-            # domain envelope. This remains fixed-budget and works even when
-            # a PDE exposes no independently mutable boundary sampler.
-            reference = current.points.detach().cpu().float()
-            proposed = candidates.points.detach().cpu().float()
-            lower = reference.amin(dim=0)
-            extent = (reference.amax(dim=0) - lower).clamp_min(1.0e-8)
-            unit = ((proposed - lower) / extent).clamp(0.0, 1.0)
-            boundary_distance = torch.minimum(unit, 1.0 - unit).amin(dim=1)
-            boundary_priority = torch.exp(-boundary_distance / 0.05)
-            scale = candidate_ranking_scores.median().clamp_min(1.0e-12)
-            candidate_ranking_scores = (
-                candidate_ranking_scores + scale * boundary_priority
+            ranking = candidate_scores.scores.detach().cpu().clone()
+            if str(action.reason.get("region_target") or "") == "boundary_regions":
+                reference = current.points.detach().cpu().float()
+                proposed = candidates.points.detach().cpu().float()
+                lower = reference.amin(dim=0)
+                extent = (reference.amax(dim=0) - lower).clamp_min(1.0e-8)
+                unit = ((proposed - lower) / extent).clamp(0.0, 1.0)
+                distance = torch.minimum(unit, 1.0 - unit).amin(dim=1)
+                ranking = ranking + ranking.median().clamp_min(1.0e-12) * torch.exp(-distance / 0.05)
+            selected = torch.argsort(ranking, descending=True)[:local_count].tolist()
+            local_points = candidates.points[selected]
+            metadata = tuple(
+                {**dict(candidates.point_metadata[index]), "origin": "local"}
+                for index in selected
             )
-        exploration_count = min(
-            replacement_count,
-            math.ceil(replacement_count * action.exploration_fraction),
-        )
-        biased_count = replacement_count - exploration_count
-        candidate_order = torch.argsort(
-            candidate_ranking_scores, descending=True
-        ).tolist()
-        selected = candidate_order[:biased_count]
-        remaining = [index for index in range(candidates.point_count) if index not in set(selected)]
-        if exploration_count:
-            permutation = torch.randperm(len(remaining)).tolist()
-            selected.extend(remaining[index] for index in permutation[:exploration_count])
-        from .sampling_runtime import SamplingBatch
-
+        points = local_points
+        if global_count:
+            global_points = sampler.generate_candidate_points(action.sampler_id, global_count)
+            points = torch.cat((local_points, global_points.points), dim=0)
+            metadata += tuple({**dict(item), "origin": "global"} for item in global_points.point_metadata)
         replacement = SamplingBatch(
             sampler_id=action.sampler_id,
-            points=candidates.points[selected].detach().clone(),
-            point_metadata=tuple(candidates.point_metadata[index] for index in selected),
-            state_version=candidates.state_version,
+            points=points.detach().clone(),
+            point_metadata=metadata,
+            state_version=current.state_version,
         )
         mutation = sampler.replace_subset(
             action.sampler_id,
-            retained_indices,
+            [],
             replacement,
-            hard_retained_indices=hard,
-            exploration_count=exploration_count,
+            exploration_count=global_count,
             iteration=self._actual_iterations,
-            current_scores=scores.tolist(),
         )
         self.sampling_control_summary["sampling_compute_time"] += (
             time.perf_counter() - compute_started
@@ -6192,84 +6147,8 @@ class OpenSpecTrainer(AdaptiveOnlineMixin):
         return mutation
 
     def _assess_pending_sampling_action(self, result: Any, phase: Any | None) -> None:
-        pending = self._pending_sampling_observation
-        controller = self.fixed_budget_sampling_controller
-        if pending is None or controller is None:
-            return
-        baseline = pending.get("baseline")
-        if not baseline:
-            return
-        pending["validation_checks"] = int(pending.get("validation_checks", 0)) + 1
-        aggregate_bad = float(result.aggregate_score) > float(
-            baseline["aggregate_score"]
-        ) * float(controller.config["validation_degradation_ratio"])
-        baseline_components = dict(baseline.get("normalized_component_scores") or {})
-        component_bad = any(
-            component_id in result.normalized_component_scores
-            and component_id in baseline_components
-            and float(result.normalized_component_scores[component_id])
-            > float(baseline_components[component_id])
-            * float(controller.config["associated_component_degradation_ratio"])
-            for component_id in pending.get("associated_component_ids") or []
-        )
-        associated_ids = set(pending.get("associated_component_ids") or [])
-        associated_categories = {
-            descriptor.category
-            for descriptor in self.registry.loss_components
-            if descriptor.component_id in associated_ids
-        } if self.registry is not None else set()
-        baseline_categories = dict(baseline.get("category_scores") or {})
-        category_bad = any(
-            category in result.category_scores
-            and category in baseline_categories
-            and float(result.category_scores[category])
-            > float(baseline_categories[category])
-            * float(controller.config["associated_component_degradation_ratio"])
-            for category in associated_categories
-        )
-        critical_ids = {
-            descriptor.component_id
-            for descriptor in self.registry.loss_components
-            if bool(descriptor.metadata.get("critical_for_valid_solution", False))
-        } if self.registry is not None else set()
-        critical_bad = any(
-            component_id in result.normalized_component_scores
-            and component_id in baseline_components
-            and float(result.normalized_component_scores[component_id])
-            > float(baseline_components[component_id])
-            * float(controller.config["associated_component_degradation_ratio"])
-            for component_id in critical_ids
-        )
-        pending["degradation_checks"] = (
-            int(pending.get("degradation_checks", 0)) + 1
-            if aggregate_bad or component_bad or category_bad or critical_bad else 0
-        )
-        minimum_checks = int(controller.config["minimum_validation_stability_checks"])
-        if int(pending["degradation_checks"]) >= minimum_checks:
-            if self.rollback_manager is not None:
-                self.rollback_manager.clear()
-            self._emit_adaptive_audit(
-                iteration=self._actual_iterations,
-                stage=str(getattr(phase, "name", "training")),
-                controller=controller.name,
-                event_type="sampling_delayed_feedback",
-                trigger={
-                    "outcome": "failure",
-                    "reason": "sampling_physics_validation_degradation",
-                    "continued_without_rollback": True,
-                },
-            )
-            self._pending_sampling_observation = None
-            return
-        observation_complete = (
-            self._actual_iterations - int(pending["start_iteration"])
-            >= int(controller.config["observation_window_iterations"])
-            and int(pending["validation_checks"]) >= minimum_checks
-        )
-        if observation_complete:
-            if self.rollback_manager is not None:
-                self.rollback_manager.clear()
-            self._pending_sampling_observation = None
+        """Discard legacy pending feedback; sampling changes are whitelisted."""
+        self._pending_sampling_observation = None
 
     def _note_curriculum_training_iteration(self) -> None:
         if self._curriculum_resume_disabled:

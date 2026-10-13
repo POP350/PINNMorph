@@ -424,9 +424,12 @@ PRIMITIVE_PARAMETER_CONTRACTS: dict[str, dict[str, Any]] = {
         "pde_multiplier": "number in [0.25, 1]",
     },
     ADAPT_SAMPLING_DISTRIBUTION: {
-        "replacement_fraction": "number in (0, 1]",
-        "exploration_fraction": "number in (0, 1]",
+        "local_fraction": "number in [0,1]; global fraction is its complement",
+        "global_fraction": "number in [0,1]; local+global must equal 1",
+        "replacement_fraction": "legacy alias for local_fraction, number in [0,1]",
+        "exploration_fraction": "legacy alias for global_fraction, number in [0,1]",
         "candidate_multiplier": "integer >= 1",
+        "point_count": "positive integer total PDE training points; may exceed configured sampling limits",
     },
     ENTER_LBFGS_PHASE: {
         "minimum_plateau_steps": "integer >= 1",
@@ -542,7 +545,7 @@ class PrimitiveOperation:
                 parameters[key] = list(dict.fromkeys(int(index) for index in item))
             elif key in {
                 "branch_width", "minimum_width", "branch_depth", "expert_count",
-                "component_index", "candidate_multiplier",
+                "component_index", "candidate_multiplier", "point_count",
             }:
                 if isinstance(item, bool) or not isinstance(item, int):
                     raise ValueError(f"{key} must be an integer")
@@ -561,6 +564,9 @@ class PrimitiveOperation:
                     )
                 parameters[key] = str(item)
             else:
+                if (name == ADAPT_SAMPLING_DISTRIBUTION and isinstance(item, bool)
+                        and key in {"local_fraction", "global_fraction", "replacement_fraction", "exploration_fraction"}):
+                    raise ValueError("Sampling fractions must be numbers, not booleans")
                 numeric = float(item)
                 if not math.isfinite(numeric):
                     raise ValueError(f"{key} must be finite")
@@ -581,6 +587,10 @@ class PrimitiveOperation:
                     if key in {"residual_power", "distance_power"}
                     else (0.1, 10.0)
                     if key == "localization_scale"
+                    else (0.0, 1.0)
+                    if name == ADAPT_SAMPLING_DISTRIBUTION and key in {
+                        "local_fraction", "global_fraction", "replacement_fraction", "exploration_fraction",
+                    }
                     else (1e-6, 1.0)
                     if key in {
                         "adaptation_rate", "projection_strength",
@@ -591,6 +601,9 @@ class PrimitiveOperation:
                 if not lower <= numeric <= upper:
                     raise ValueError(f"{key} must be in [{lower}, {upper}]")
                 parameters[key] = numeric
+        if name == ADAPT_SAMPLING_DISTRIBUTION:
+            from .sampling_runtime import sampling_policy_fractions
+            sampling_policy_fractions(parameters)
         object.__setattr__(self, "parameters", parameters)
 
     @classmethod

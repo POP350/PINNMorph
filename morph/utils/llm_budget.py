@@ -11,10 +11,13 @@ class BudgetedProvider:
     def __init__(self, provider, state, config):
         self.provider, self.state, self.config = provider, state, config
 
-    def complete_text(self, *args, **kwargs):
+    def ensure_available(self):
         reason = budget_reason(self.state, self.config)
         if reason:
             raise LLMBudgetExceeded(reason)
+
+    def complete_text(self, *args, **kwargs):
+        self.ensure_available()
         self.state["calls"] = self.state.get("calls", 0) + 1
         started = time.perf_counter()
         try:
@@ -26,9 +29,11 @@ class BudgetedProvider:
 def budget_reason(state, config):
     if not config.get("enabled"):
         return None
-    if state.get("calls", 0) >= config.get("maximum_calls", 100):
+    call_limit = int(config.get("maximum_calls", 0))
+    if call_limit > 0 and state.get("calls", 0) >= call_limit:
         return "llm_call_budget_exhausted"
-    if state.get("wall_seconds", 0.0) >= config.get("maximum_wall_seconds", 900):
+    wall_limit = float(config.get("maximum_wall_seconds", 900))
+    if wall_limit > 0 and state.get("wall_seconds", 0.0) >= wall_limit:
         return "llm_time_budget_exhausted"
     return None
 

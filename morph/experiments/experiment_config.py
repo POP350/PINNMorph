@@ -88,6 +88,8 @@ def apply_ablation_mode(config: Mapping[str, Any], mode: str | None) -> dict[str
     result = deepcopy(dict(config))
     result["ablation_mode"] = selected
     online = deepcopy(dict(result.get("online_morphing") or {}))
+    # The mandatory step-200 LLM sampling request is a Full-only privilege.
+    online["forced_initial_sampling_step"] = 0
     policy_set = deepcopy(dict(online.get("policy_set") or {}))
     evolution = deepcopy(dict(policy_set.get("evolution") or {}))
     if selected == NO_MORPH_ABLATION:

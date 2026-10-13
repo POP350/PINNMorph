@@ -7,6 +7,7 @@ from typing import Any
 
 from .state import AdaptiveAction, TrainerObservableState
 from ..registry import TrainingComponentRegistry
+from ..sampling_runtime import fixed_pde_cloud_counts
 
 
 REGISTERED_ACTION_TYPES = frozenset(
@@ -271,12 +272,17 @@ class ActionBoundaryValidator:
         replacement = float(action.after.get("replacement_fraction", -1.0))
         retention = float(action.after.get("hard_point_retention_fraction", -1.0))
         exploration = float(action.after.get("exploration_fraction", -1.0))
-        if not 0.0 < replacement < 1.0:
-            raise ActionValidationError("replacement_fraction must be in (0, 1)")
+        if not 0.0 <= replacement <= 1.0:
+            raise ActionValidationError("local sampling fraction must be in [0, 1]")
         if not 0.0 <= retention <= 1.0 or not 0.0 <= exploration <= 1.0:
             raise ActionValidationError("retention and exploration fractions must be in [0, 1]")
         if replacement + retention > 1.0 + 1e-12:
             raise ActionValidationError("replacement and hard-retention fractions overlap")
+        if (
+            not math.isclose(replacement + exploration, 1.0, abs_tol=1e-6)
+            or retention != 0.0
+        ):
+            raise ActionValidationError("PDE cloud allocation must sum to 1 with no retained old points")
         component_state = dict(state.sampling_component_states.get(sampler_id) or {})
         point_count = int(component_state.get("point_count", descriptor.point_budget or 0))
         if point_count < int(descriptor.minimum_point_count):
@@ -287,7 +293,7 @@ class ActionBoundaryValidator:
         action_version = int(action.after.get("sampler_state_version", -1))
         if action_version != expected_version:
             raise ActionValidationError("Sampler state version changed after action proposal")
-        replacement_count = max(1, int(point_count * replacement))
+        replacement_count, _ = fixed_pde_cloud_counts(point_count, replacement)
         candidate_count = int(action.after.get("candidate_count", 0))
         if candidate_count < replacement_count:
             raise ActionValidationError("Candidate count cannot cover the requested replacements")
